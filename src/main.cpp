@@ -282,6 +282,50 @@ static void lcd_init(void)
 /* ==========================================================================
  * Dashboard Rendering
  * ========================================================================== */
+static void update_wifi_card_lines(void)
+{
+    char line[64];
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        snprintf(line, sizeof(line), "WiFi:  [OK] %-14s (%ddBm)   ", s_wifi_ssid.c_str(), (int)WiFi.RSSI());
+        lcd_draw_text(18, 52, line, COL_GREEN, COL_CARD, 1);
+
+        char time_str[20] = "NTP: Syncing";
+        time_t now = time(nullptr);
+        struct tm ti;
+        localtime_r(&now, &ti);
+        if (ti.tm_year >= (2024 - 1900))
+        {
+            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+        }
+        snprintf(line, sizeof(line), "IP:    %-15s | %-10s", WiFi.localIP().toString().c_str(), time_str);
+        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
+    }
+    else if (s_wifi_connecting)
+    {
+        snprintf(line, sizeof(line), "WiFi:  [CONNECTING...] %-12s   ", s_wifi_ssid.c_str());
+        lcd_draw_text(18, 52, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "MAC:   %-28s", WiFi.macAddress().c_str());
+        lcd_draw_text(18, 68, line, COL_GRAY, COL_CARD, 1);
+    }
+    else
+    {
+        if (s_wifi_ssid.length() > 0)
+        {
+            snprintf(line, sizeof(line), "WiFi:  [OFFLINE] %-18s", s_wifi_ssid.c_str());
+            lcd_draw_text(18, 52, line, RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
+        }
+        else
+        {
+            lcd_draw_text(18, 52, "WiFi:  [NOT CONFIGURED] Set on Console", COL_GRAY, COL_CARD, 1);
+        }
+
+        snprintf(line, sizeof(line), "MAC:   %-28s", WiFi.macAddress().c_str());
+        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
+    }
+}
+
 static void draw_static_ui(void)
 {
     const CompanionTheme &thm = kThemes[s_theme_idx];
@@ -304,43 +348,7 @@ static void draw_static_ui(void)
     snprintf(line, sizeof(line), "Theme: %-12s (BOOT btn)", thm.name);
     lcd_draw_text(18, 36, line, COL_WHITE, COL_CARD, 1);
 
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        snprintf(line, sizeof(line), "WiFi:  [OK] %-14s (%ddBm)", s_wifi_ssid.c_str(), WiFi.RSSI());
-        lcd_draw_text(18, 52, line, COL_GREEN, COL_CARD, 1);
-
-        char time_str[32] = "NTP: Synced";
-        struct tm ti;
-        if (getLocalTime(&ti, 10))
-        {
-            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
-        }
-        snprintf(line, sizeof(line), "IP:    %-15s | %s", WiFi.localIP().toString().c_str(), time_str);
-        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
-    }
-    else if (s_wifi_connecting)
-    {
-        snprintf(line, sizeof(line), "WiFi:  [CONNECTING...] %-12s", s_wifi_ssid.c_str());
-        lcd_draw_text(18, 52, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
-
-        snprintf(line, sizeof(line), "MAC:   %s", WiFi.macAddress().c_str());
-        lcd_draw_text(18, 68, line, COL_GRAY, COL_CARD, 1);
-    }
-    else
-    {
-        if (s_wifi_ssid.length() > 0)
-        {
-            snprintf(line, sizeof(line), "WiFi:  [OFFLINE] %-14s", s_wifi_ssid.c_str());
-            lcd_draw_text(18, 52, line, RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
-        }
-        else
-        {
-            lcd_draw_text(18, 52, "WiFi:  [NOT CONFIGURED] Set on Console", COL_GRAY, COL_CARD, 1);
-        }
-
-        snprintf(line, sizeof(line), "MAC:   %s", WiFi.macAddress().c_str());
-        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
-    }
+    update_wifi_card_lines();
 
     /* Onboard addressable LED on ESP32-C6-LCD-1.47 uses GRB byte order */
     neopixelWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
@@ -355,6 +363,10 @@ static void update_dynamic_ui(void)
     if (was_online != s_stm32_online)
     {
         draw_static_ui();
+    }
+    else
+    {
+        update_wifi_card_lines();
     }
 
     if (s_stm32_online)
