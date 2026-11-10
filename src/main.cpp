@@ -64,6 +64,16 @@ static uint32_t s_boot_presses = 0;
 static uint32_t s_uart_tx_cnt  = 0;
 static uint32_t s_uart_rx_cnt  = 0;
 
+static bool     s_stm32_online   = false;
+static uint32_t s_last_stm32_rx  = 0;
+static uint32_t s_stm32_heap     = 0;
+static int32_t  s_stm32_tmcu     = 0;
+static int32_t  s_stm32_text     = -999;
+static char     s_stm32_app[32]  = "connecting...";
+
+static char     s_rx_line[128];
+static uint16_t s_rx_line_len    = 0;
+
 /* ==========================================================================
  * Compact 5x7 ASCII Font (0x20..0x7E)
  * ========================================================================== */
@@ -271,23 +281,21 @@ static void draw_static_ui(void)
     lcd_draw_text(8, 5, "STM32 + ESP32-C6 HUD", thm.accent565, thm.bar565, 2);
 
     /* Info Cards */
-    lcd_fill_rect(8, 32, 304, 64, COL_CARD);
-    lcd_fill_rect(8, 32, 3, 64, thm.accent565);
+    lcd_fill_rect(8, 30, 304, 58, COL_CARD);
+    lcd_fill_rect(8, 30, 3, 58, thm.accent565);
 
-    lcd_fill_rect(8, 102, 304, 62, COL_CARD);
-    lcd_fill_rect(8, 102, 3, 62, COL_GREEN);
+    lcd_fill_rect(8, 92, 304, 74, COL_CARD);
+    lcd_fill_rect(8, 92, 3, 74, s_stm32_online ? COL_GREEN : RGB888_TO_565(0xC6, 0x28, 0x28));
 
     char line[64];
     snprintf(line, sizeof(line), "Theme: %-12s (BOOT btn)", thm.name);
-    lcd_draw_text(18, 40, line, COL_WHITE, COL_CARD, 1);
+    lcd_draw_text(18, 36, line, COL_WHITE, COL_CARD, 1);
 
-    snprintf(line, sizeof(line), "Chip:  ESP32-C6 RISC-V @ %lu MHz", (unsigned long)getCpuFrequencyMhz());
-    lcd_draw_text(18, 56, line, COL_GRAY, COL_CARD, 1);
+    snprintf(line, sizeof(line), "ESP:   C6 RISC-V 160MHz | RAM: %luK", (unsigned long)(ESP.getFreeHeap() / 1024U));
+    lcd_draw_text(18, 52, line, COL_GRAY, COL_CARD, 1);
 
     snprintf(line, sizeof(line), "MAC:   %s", WiFi.macAddress().c_str());
-    lcd_draw_text(18, 72, line, COL_YELLOW, COL_CARD, 1);
-
-    lcd_draw_text(18, 110, "UART1 Link: TX=GP18 -> PA1 | RX=GP19 <- PA0", COL_GREEN, COL_CARD, 1);
+    lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
 
     /* Onboard addressable LED on ESP32-C6-LCD-1.47 uses GRB byte order */
     neopixelWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
@@ -296,17 +304,89 @@ static void draw_static_ui(void)
 static void update_dynamic_ui(void)
 {
     char line[64];
-    uint32_t up_sec = millis() / 1000U;
-    uint32_t heap_kb = ESP.getFreeHeap() / 1024U;
+    bool was_online = s_stm32_online;
+    s_stm32_online = (millis() - s_last_stm32_rx) < 1800U;
 
-    snprintf(line, sizeof(line), "Up: %02lu:%02lu | Free RAM: %lu KB | Btn: %lu   ",
-             (unsigned long)(up_sec / 60U), (unsigned long)(up_sec % 60U),
-             (unsigned long)heap_kb, (unsigned long)s_boot_presses);
-    lcd_draw_text(18, 128, line, COL_WHITE, COL_CARD, 1);
+    if (was_online != s_stm32_online)
+    {
+        draw_static_ui();
+    }
 
-    snprintf(line, sizeof(line), "STM32 Link: TX=%lu pkts | RX=%lu bytes   ",
-             (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt);
-    lcd_draw_text(18, 144, line, COL_GRAY, COL_CARD, 1);
+    if (s_stm32_online)
+    {
+        snprintf(line, sizeof(line), "STM32: [ONLINE] App: %-14s", s_stm32_app);
+        lcd_draw_text(18, 98, line, COL_GREEN, COL_CARD, 1);
+
+        char ext_buf[16];
+        if (s_stm32_text > -900)
+        {
+            snprintf(ext_buf, sizeof(ext_buf), "%ld.%ld C", (long)(s_stm32_text / 10), (long)(abs(s_stm32_text) % 10));
+        }
+        else
+        {
+            snprintf(ext_buf, sizeof(ext_buf), "N/A");
+        }
+
+        snprintf(line, sizeof(line), "MCU: %ld.%ld C | DS18B20: %-10s",
+                 (long)(s_stm32_tmcu / 10), (long)(abs(s_stm32_tmcu) % 10), ext_buf);
+        lcd_draw_text(18, 114, line, COL_WHITE, COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "Heap: %lu KB Free | TX:%lu RX:%lu   ",
+                 (unsigned long)s_stm32_heap, (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt);
+        lcd_draw_text(18, 130, line, COL_GRAY, COL_CARD, 1);
+
+        lcd_draw_text(18, 146, "Link: PA0/PA1 <-> GP18/GP19 [OK]   ", COL_YELLOW, COL_CARD, 1);
+    }
+    else
+    {
+        lcd_draw_text(18, 98,  "STM32: [WAITING LINK...]          ", RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
+        lcd_draw_text(18, 114, "Wiring: PA0->GP19 | PA1<-GP18     ", COL_WHITE, COL_CARD, 1);
+        snprintf(line, sizeof(line), "Packets: TX=%lu | RX=%lu bytes   ",
+                 (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt);
+        lcd_draw_text(18, 130, line, COL_GRAY, COL_CARD, 1);
+        lcd_draw_text(18, 146, "Press BOOT btn to test themes     ", COL_YELLOW, COL_CARD, 1);
+    }
+}
+
+static void handle_stm32_packet(const char *pkt)
+{
+    if (strncmp(pkt, "STM32:HB", 8) == 0)
+    {
+        s_last_stm32_rx = millis();
+
+        const char *p = strstr(pkt, "HEAP=");
+        if (p) s_stm32_heap = (uint32_t)strtoul(p + 5, NULL, 10);
+
+        p = strstr(pkt, "TMCU=");
+        if (p) s_stm32_tmcu = (int32_t)strtol(p + 5, NULL, 10);
+
+        p = strstr(pkt, "TEXT=");
+        if (p) s_stm32_text = (int32_t)strtol(p + 5, NULL, 10);
+
+        p = strstr(pkt, "THM=");
+        if (p)
+        {
+            uint8_t thm = (uint8_t)atoi(p + 4);
+            if (thm < 4 && thm != s_theme_idx)
+            {
+                s_theme_idx = thm;
+                draw_static_ui();
+            }
+        }
+
+        p = strstr(pkt, "APP=");
+        if (p)
+        {
+            strncpy(s_stm32_app, p + 4, sizeof(s_stm32_app) - 1);
+            s_stm32_app[sizeof(s_stm32_app) - 1] = '\0';
+            char *eol = strchr(s_stm32_app, '\r');
+            if (eol) *eol = '\0';
+            eol = strchr(s_stm32_app, '\n');
+            if (eol) *eol = '\0';
+        }
+
+        update_dynamic_ui();
+    }
 }
 
 void setup()
@@ -340,6 +420,11 @@ void loop()
             s_theme_idx = (s_theme_idx + 1U) % 4U;
             draw_static_ui();
             update_dynamic_ui();
+
+            /* Notify STM32 of theme change from ESP32 */
+            Serial1.printf("ESP32:SET_THM=%u\n", (unsigned int)s_theme_idx);
+            s_uart_tx_cnt++;
+
             Serial.printf("[ESP32-C6] Switched theme to %s (press #%lu)\r\n",
                           kThemes[s_theme_idx].name, (unsigned long)s_boot_presses);
         }
@@ -348,8 +433,22 @@ void loop()
 
     while (Serial1.available() > 0)
     {
-        (void)Serial1.read();
+        char c = (char)Serial1.read();
         s_uart_rx_cnt++;
+
+        if (c == '\n' || c == '\r')
+        {
+            if (s_rx_line_len > 0)
+            {
+                s_rx_line[s_rx_line_len] = '\0';
+                handle_stm32_packet(s_rx_line);
+                s_rx_line_len = 0;
+            }
+        }
+        else if (s_rx_line_len < (sizeof(s_rx_line) - 1))
+        {
+            s_rx_line[s_rx_line_len++] = c;
+        }
     }
 
     if (millis() - last_tick >= 500U)
