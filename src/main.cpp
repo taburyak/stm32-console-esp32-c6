@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include "driver/uart.h"
+#include "driver/gpio.h"
 
 /* ==========================================================================
  * ESP32-C6-LCD-1.47 Onboard Pin Definitions
@@ -389,16 +391,39 @@ static void handle_stm32_packet(const char *pkt)
     }
 }
 
+static void stm32_uart_init(void)
+{
+    uart_config_t cfg = {};
+    cfg.baud_rate  = STM32_UART_BAUD;
+    cfg.data_bits  = UART_DATA_8_BITS;
+    cfg.parity     = UART_PARITY_DISABLE;
+    cfg.stop_bits  = UART_STOP_BITS_1;
+    cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
+    cfg.source_clk = UART_SCLK_XTAL;
+
+    (void)uart_driver_install(UART_NUM_1, 512, 512, 0, NULL, 0);
+    (void)uart_param_config(UART_NUM_1, &cfg);
+    (void)uart_set_pin(UART_NUM_1, STM32_UART_TX, STM32_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    (void)gpio_set_drive_capability((gpio_num_t)STM32_UART_TX, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_pull_mode((gpio_num_t)STM32_UART_RX, GPIO_PULLUP_ONLY);
+}
+
+static void stm32_uart_send(const char *str)
+{
+    if (str != NULL)
+    {
+        (void)uart_write_bytes(UART_NUM_1, str, strlen(str));
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
-    /* Initialize UART1 on GP18 (TX) / GP19 (RX) for STM32F407 P11 header */
-    Serial1.begin(STM32_UART_BAUD, SERIAL_8N1, STM32_UART_RX, STM32_UART_TX);
-
     WiFi.mode(WIFI_STA);
     lcd_init();
+    stm32_uart_init();
     draw_static_ui();
     update_dynamic_ui();
 
@@ -422,7 +447,9 @@ void loop()
             update_dynamic_ui();
 
             /* Notify STM32 of theme change from ESP32 */
-            Serial1.printf("ESP32:SET_THM=%u\n", (unsigned int)s_theme_idx);
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "ESP32:SET_THM=%u\n", (unsigned int)s_theme_idx);
+            stm32_uart_send(cmd);
             s_uart_tx_cnt++;
 
             Serial.printf("[ESP32-C6] Switched theme to %s (press #%lu)\r\n",
@@ -431,9 +458,11 @@ void loop()
     }
     last_btn = btn;
 
-    while (Serial1.available() > 0)
+    uint8_t rx_buf[64];
+    int rx_len = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), 0);
+    for (int i = 0; i < rx_len; i++)
     {
-        char c = (char)Serial1.read();
+        char c = (char)rx_buf[i];
         s_uart_rx_cnt++;
 
         if (c == '\n' || c == '\r')
@@ -455,7 +484,7 @@ void loop()
     {
         last_tick = millis();
         /* Send periodic heartbeat frame on UART1 (GP18) for STM32F407 */
-        Serial1.print("ESP32C6:HB\n");
+        stm32_uart_send("ESP32C6:HB\n");
         s_uart_tx_cnt++;
         update_dynamic_ui();
     }
