@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <Preferences.h>
+#include <time.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
@@ -65,6 +67,15 @@ static uint8_t  s_theme_idx    = 0;
 static uint32_t s_boot_presses = 0;
 static uint32_t s_uart_tx_cnt  = 0;
 static uint32_t s_uart_rx_cnt  = 0;
+
+static Preferences s_prefs;
+static String   s_wifi_ssid        = "";
+static String   s_wifi_pass        = "";
+static bool     s_wifi_connecting  = false;
+static uint32_t s_wifi_conn_start  = 0;
+static bool     s_ntp_synced       = false;
+static uint32_t s_last_ntp_sync    = 0;
+static uint32_t s_last_ntp_poll    = 0;
 
 static bool     s_stm32_online   = false;
 static uint32_t s_last_stm32_rx  = 0;
@@ -293,11 +304,43 @@ static void draw_static_ui(void)
     snprintf(line, sizeof(line), "Theme: %-12s (BOOT btn)", thm.name);
     lcd_draw_text(18, 36, line, COL_WHITE, COL_CARD, 1);
 
-    snprintf(line, sizeof(line), "ESP:   C6 RISC-V 160MHz | RAM: %luK", (unsigned long)(ESP.getFreeHeap() / 1024U));
-    lcd_draw_text(18, 52, line, COL_GRAY, COL_CARD, 1);
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        snprintf(line, sizeof(line), "WiFi:  [OK] %-14s (%ddBm)", s_wifi_ssid.c_str(), WiFi.RSSI());
+        lcd_draw_text(18, 52, line, COL_GREEN, COL_CARD, 1);
 
-    snprintf(line, sizeof(line), "MAC:   %s", WiFi.macAddress().c_str());
-    lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
+        char time_str[32] = "NTP: Synced";
+        struct tm ti;
+        if (getLocalTime(&ti, 10))
+        {
+            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+        }
+        snprintf(line, sizeof(line), "IP:    %-15s | %s", WiFi.localIP().toString().c_str(), time_str);
+        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
+    }
+    else if (s_wifi_connecting)
+    {
+        snprintf(line, sizeof(line), "WiFi:  [CONNECTING...] %-12s", s_wifi_ssid.c_str());
+        lcd_draw_text(18, 52, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "MAC:   %s", WiFi.macAddress().c_str());
+        lcd_draw_text(18, 68, line, COL_GRAY, COL_CARD, 1);
+    }
+    else
+    {
+        if (s_wifi_ssid.length() > 0)
+        {
+            snprintf(line, sizeof(line), "WiFi:  [OFFLINE] %-14s", s_wifi_ssid.c_str());
+            lcd_draw_text(18, 52, line, RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
+        }
+        else
+        {
+            lcd_draw_text(18, 52, "WiFi:  [NOT CONFIGURED] Set on Console", COL_GRAY, COL_CARD, 1);
+        }
+
+        snprintf(line, sizeof(line), "MAC:   %s", WiFi.macAddress().c_str());
+        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
+    }
 
     /* Onboard addressable LED on ESP32-C6-LCD-1.47 uses GRB byte order */
     neopixelWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
@@ -389,6 +432,41 @@ static void handle_stm32_packet(const char *pkt)
 
         update_dynamic_ui();
     }
+    else if (strncmp(pkt, "STM32:SET_WIFI", 14) == 0)
+    {
+        const char *p_s = strstr(pkt, "SSID=");
+        const char *p_p = strstr(pkt, "PASS=");
+        if (p_s)
+        {
+            p_s += 5;
+            size_t l = strcspn(p_s, ",\r\n");
+            s_wifi_ssid = String(p_s).substring(0, l);
+        }
+        if (p_p)
+        {
+            p_p += 5;
+            size_t l = strcspn(p_p, ",\r\n");
+            s_wifi_pass = String(p_p).substring(0, l);
+        }
+        else
+        {
+            s_wifi_pass = "";
+        }
+
+        s_prefs.putString("ssid", s_wifi_ssid);
+        s_prefs.putString("pass", s_wifi_pass);
+
+        WiFi.disconnect();
+        if (s_wifi_ssid.length() > 0)
+        {
+            WiFi.begin(s_wifi_ssid.c_str(), s_wifi_pass.c_str());
+            s_wifi_connecting = true;
+            s_wifi_conn_start = millis();
+            s_ntp_synced      = false;
+        }
+        draw_static_ui();
+        update_dynamic_ui();
+    }
 }
 
 static void stm32_uart_init(void)
@@ -421,7 +499,18 @@ void setup()
     Serial.begin(115200);
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
+    s_prefs.begin("wifi_cfg", false);
+    s_wifi_ssid = s_prefs.getString("ssid", "");
+    s_wifi_pass = s_prefs.getString("pass", "");
+
     WiFi.mode(WIFI_STA);
+    if (s_wifi_ssid.length() > 0)
+    {
+        WiFi.begin(s_wifi_ssid.c_str(), s_wifi_pass.c_str());
+        s_wifi_connecting = true;
+        s_wifi_conn_start = millis();
+    }
+
     lcd_init();
     stm32_uart_init();
     draw_static_ui();
@@ -480,11 +569,77 @@ void loop()
         }
     }
 
+    /* Check Wi-Fi state transitions */
+    if (s_wifi_connecting)
+    {
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            s_wifi_connecting = false;
+            s_ntp_synced      = false;
+            configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4", "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+            draw_static_ui();
+            update_dynamic_ui();
+        }
+        else if ((millis() - s_wifi_conn_start) > 20000U)
+        {
+            s_wifi_connecting = false;
+            draw_static_ui();
+            update_dynamic_ui();
+        }
+    }
+
+    /* NTP Synchronization (poll every 2s until synced, then refresh every hour) */
+    if (WiFi.status() == WL_CONNECTED && (!s_ntp_synced || (millis() - s_last_ntp_sync > 3600000U)))
+    {
+        if (millis() - s_last_ntp_poll >= 2000U)
+        {
+            s_last_ntp_poll = millis();
+            struct tm ti;
+            if (getLocalTime(&ti, 50))
+            {
+                if (ti.tm_year >= (2024 - 1900))
+                {
+                    s_ntp_synced    = true;
+                    s_last_ntp_sync = millis();
+                    int stm_wd      = (ti.tm_wday == 0) ? 7 : ti.tm_wday; // Monday=1..Sunday=7
+                    char time_buf[64];
+                    snprintf(time_buf, sizeof(time_buf),
+                             "ESP32:TIME,Y=%d,M=%d,D=%d,WD=%d,H=%d,MIN=%d,S=%d\n",
+                             ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                             stm_wd, ti.tm_hour, ti.tm_min, ti.tm_sec);
+                    stm32_uart_send(time_buf);
+                    Serial.printf("[NTP] Synced time: %s", time_buf);
+                    draw_static_ui();
+                    update_dynamic_ui();
+                }
+            }
+        }
+    }
+
     if (millis() - last_tick >= 500U)
     {
         last_tick = millis();
-        /* Send periodic heartbeat frame on UART1 (GP18) for STM32F407 */
-        stm32_uart_send("ESP32C6:HB\n");
+        int wifi_code = 0;
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            wifi_code = 1;
+        }
+        else if (s_wifi_connecting)
+        {
+            wifi_code = 2;
+        }
+        else if (s_wifi_ssid.length() > 0)
+        {
+            wifi_code = -1;
+        }
+
+        char hb[128];
+        snprintf(hb, sizeof(hb), "ESP32C6:HB,WIFI=%d,IP=%s,RSSI=%d,SSID=%.20s\n",
+                 wifi_code,
+                 (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "0.0.0.0",
+                 (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
+                 s_wifi_ssid.c_str());
+        stm32_uart_send(hb);
         s_uart_tx_cnt++;
         update_dynamic_ui();
     }
