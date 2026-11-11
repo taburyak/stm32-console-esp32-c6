@@ -563,7 +563,7 @@ static void render_screen_weather_clock(void)
 static void update_dynamic_ui(void)
 {
     bool was_online = s_stm32_online;
-    s_stm32_online = (millis() - s_last_stm32_rx) < 1800U;
+    s_stm32_online = (millis() - s_last_stm32_rx) < 5000U;
 
     if (was_online != s_stm32_online)
     {
@@ -1062,6 +1062,8 @@ static void web_setup_routes(void)
     });
 
     s_web.on("/api/status", HTTP_GET, []() {
+        poll_stm32_uart();
+        s_stm32_online = (millis() - s_last_stm32_rx) < 5000U;
         char json[384];
         snprintf(json, sizeof(json),
                  "{\"stm32_online\":%s,\"app\":\"%s\",\"tmcu_deci\":%ld,\"text_deci\":%ld,"
@@ -1172,31 +1174,45 @@ static void web_setup_routes(void)
         s_web.send(200, guess_mime_type(path, is_dl), "");
 
         uint32_t remaining = total;
+        bool client_aborted = false;
         uint8_t raw[1024];
         while (remaining > 0)
         {
+            if (client_aborted || !s_web.client().connected())
+            {
+                /* Tell STM32 to abort stream immediately (< 1 ms) and close SD file */
+                uart_write_bytes(UART_NUM_1, "X", 1);
+                s_uart_tx_bytes++;
+                break;
+            }
+
+            /* Request the next chunk from STM32 BEFORE STM32 transmits any binary bytes */
+            uart_write_bytes(UART_NUM_1, "K", 1);
+            s_uart_tx_bytes++;
+
             size_t to_read = (remaining > sizeof(raw)) ? sizeof(raw) : (size_t)remaining;
             size_t got = 0;
             uint32_t chunk_t0 = millis();
             while (got < to_read && (millis() - chunk_t0) < 1500U)
             {
-                int r = uart_read_bytes(UART_NUM_1, raw + got, to_read - got, pdMS_TO_TICKS(40));
+                int r = uart_read_bytes(UART_NUM_1, raw + got, to_read - got, pdMS_TO_TICKS(25));
                 if (r > 0)
                 {
                     got += (size_t)r;
+                    s_uart_rx_bytes += (uint32_t)r;
+                    s_last_stm32_rx = millis();
                 }
             }
             if (got == 0)
             {
                 break;
             }
-            s_web.client().write(raw, got);
             remaining -= (uint32_t)got;
 
-            /* Handshake: send 1-byte ACK to STM32 to fetch the next chunk */
-            if (remaining > 0)
+            size_t written = s_web.client().write(raw, got);
+            if (written != got)
             {
-                uart_write_bytes(UART_NUM_1, "K", 1);
+                client_aborted = true;
             }
         }
     });

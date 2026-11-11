@@ -158,6 +158,8 @@ let curDir = '/';
 let curFile = '';
 let isDirty = false;
 let themeLockUntil = 0;
+let busyCount = 0;
+const imgRev = {};
 let natW = 0, natH = 0;
 const EDIT_EXTS = ['.c','.h','.txt','.md','.ini','.cfg','.log','.json','.csv'];
 const IMG_EXTS  = ['.bmp','.png','.jpg','.jpeg','.gif','.sjpg'];
@@ -209,7 +211,14 @@ function showPaneMode(mode){
   document.getElementById('btnSaveRun').style.display = isImg ? 'none' : 'inline-flex';
 }
 
+function highlightActiveRow(){
+  document.querySelectorAll('.f-row').forEach(r => {
+    r.classList.toggle('active', r.dataset.path === curFile);
+  });
+}
+
 async function pollStatus(){
+  if(busyCount > 0) return;
   try{
     const r = await fetch('/api/status');
     if(!r.ok) return;
@@ -241,6 +250,7 @@ async function loadDir(path){
   curDir = path || '/';
   document.getElementById('curPathLbl').textContent = 'SD:' + curDir;
   setStatus('Scanning SD:' + curDir + ' ...');
+  busyCount++;
   try{
     const r = await fetch('/api/fs/list?path=' + encodeURIComponent(curDir));
     const d = await r.json();
@@ -257,6 +267,7 @@ async function loadDir(path){
       const full = joinPath(curDir, item.name);
       const row = document.createElement('div');
       row.className = 'f-row' + (full === curFile ? ' active' : '');
+      row.dataset.path = full;
 
       const nameEl = document.createElement('div');
       nameEl.className = 'f-name ' + (item.dir ? 'f-dir' : '');
@@ -312,6 +323,8 @@ async function loadDir(path){
     setStatus('Loaded SD:' + curDir);
   }catch(e){
     setStatus('Connection error while listing SD.', 'var(--red)');
+  }finally{
+    busyCount = Math.max(0, busyCount - 1);
   }
 }
 
@@ -326,6 +339,7 @@ async function openFileInEditor(path){
   showPaneMode('editor');
   setStatus('Reading ' + path + ' from STM32 SD...');
   setProgress(35);
+  busyCount++;
   try{
     const r = await fetch('/api/fs/read?path=' + encodeURIComponent(path));
     if(!r.ok){
@@ -339,14 +353,16 @@ async function openFileInEditor(path){
     document.getElementById('codeArea').value = txt;
     document.getElementById('edFileTitle').textContent = '📝 ' + path;
     document.getElementById('edDirty').style.display = 'none';
+    highlightActiveRow();
     updateCursorInfo();
     setProgress(100);
     setTimeout(() => setProgress(0), 400);
     setStatus('Opened ' + path + ' (' + txt.length + ' bytes)', 'var(--green)');
-    loadDir(curDir);
   }catch(e){
     setProgress(0);
     setStatus('Error reading file', 'var(--red)');
+  }finally{
+    busyCount = Math.max(0, busyCount - 1);
   }
 }
 
@@ -366,19 +382,23 @@ function setImgZoom(scale){
   }
 }
 
+let imgBusy = false;
 function openImageInViewer(path, byteSize){
   if(isDirty && !confirm('Discard unsaved changes in ' + curFile + '?')) return;
   isDirty = false;
   curFile = path;
+  highlightActiveRow();
   showPaneMode('image');
   document.getElementById('edFileTitle').textContent = '🖼 ' + path;
   document.getElementById('edDirty').style.display = 'none';
   document.getElementById('imgMeta').textContent = 'Loading image from SD...';
   setStatus('Loading image ' + path + '...');
   setProgress(40);
+  if(!imgBusy){ imgBusy = true; busyCount++; }
 
   const img = document.getElementById('previewImg');
   img.onload = () => {
+    if(imgBusy){ imgBusy = false; busyCount = Math.max(0, busyCount - 1); }
     natW = img.naturalWidth;
     natH = img.naturalHeight;
     setImgZoom(natW <= 96 ? 3 : (natW <= 320 ? 2 : 0));
@@ -390,12 +410,13 @@ function openImageInViewer(path, byteSize){
     setStatus('Loaded image ' + path, 'var(--green)');
   };
   img.onerror = () => {
+    if(imgBusy){ imgBusy = false; busyCount = Math.max(0, busyCount - 1); }
     setProgress(0);
     document.getElementById('imgMeta').textContent = 'Failed to decode image';
     setStatus('Failed to load image ' + path, 'var(--red)');
   };
-  img.src = '/api/fs/read?path=' + encodeURIComponent(path) + '&t=' + Date.now();
-  loadDir(curDir);
+  const rev = imgRev[path] ? ('&v=' + imgRev[path]) : '';
+  img.src = '/api/fs/read?path=' + encodeURIComponent(path) + rev;
 }
 
 async function setAsWallpaper(){
@@ -417,26 +438,33 @@ function toHexString(u8){
 async function writeBytesChunked(path, uint8Arr){
   const CHUNK = 768;
   const total = uint8Arr.length;
-  if(total === 0){
-    const r = await fetch('/api/fs/write?path=' + encodeURIComponent(path) + '&mode=W', {
-      method: 'POST',
-      headers: {'Content-Type': 'text/plain'},
-      body: ''
-    });
-    return r.ok;
+  busyCount++;
+  try{
+    if(total === 0){
+      const r = await fetch('/api/fs/write?path=' + encodeURIComponent(path) + '&mode=W', {
+        method: 'POST',
+        headers: {'Content-Type': 'text/plain'},
+        body: ''
+      });
+      imgRev[path] = Date.now();
+      return r.ok;
+    }
+    for(let off = 0; off < total; off += CHUNK){
+      const slice = uint8Arr.subarray(off, Math.min(off + CHUNK, total));
+      const mode = (off === 0) ? 'W' : 'A';
+      setProgress(Math.round(((off + slice.length) * 100) / total));
+      const r = await fetch('/api/fs/write?path=' + encodeURIComponent(path) + '&mode=' + mode, {
+        method: 'POST',
+        headers: {'Content-Type': 'text/plain'},
+        body: toHexString(slice)
+      });
+      if(!r.ok) return false;
+    }
+    imgRev[path] = Date.now();
+    return true;
+  }finally{
+    busyCount = Math.max(0, busyCount - 1);
   }
-  for(let off = 0; off < total; off += CHUNK){
-    const slice = uint8Arr.subarray(off, Math.min(off + CHUNK, total));
-    const mode = (off === 0) ? 'W' : 'A';
-    setProgress(Math.round(((off + slice.length) * 100) / total));
-    const r = await fetch('/api/fs/write?path=' + encodeURIComponent(path) + '&mode=' + mode, {
-      method: 'POST',
-      headers: {'Content-Type': 'text/plain'},
-      body: toHexString(slice)
-    });
-    if(!r.ok) return false;
-  }
-  return true;
 }
 
 async function saveCurrentFile(andRun){
