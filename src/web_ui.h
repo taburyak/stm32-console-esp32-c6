@@ -48,6 +48,10 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
 .f-acts button{padding:3px 6px;font-size:0.74rem}
 .editor-wrap{flex:1;display:flex;flex-direction:column;min-height:420px}
 #codeArea{flex:1;width:100%;background:#090d14;color:#e8f0fe;border:none;padding:12px;font-family:'Cascadia Code',Consolas,'Courier New',monospace;font-size:0.9rem;line-height:1.45;resize:none;outline:none;tab-size:4}
+.img-viewer{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:18px;background:#090d14;min-height:420px;overflow:auto}
+.img-stage{padding:12px;border-radius:10px;border:1px dashed var(--border);background:repeating-conic-gradient(#121824 0% 25%, #0c111a 0% 50%) 50% / 20px 20px;display:flex;align-items:center;justify-content:center;max-width:100%}
+#previewImg{max-width:100%;max-height:58vh;image-rendering:pixelated;border:1px solid var(--border);box-shadow:0 6px 24px rgba(0,0,0,0.6)}
+.img-meta{font-family:Consolas,monospace;font-size:0.84rem;color:var(--accent)}
 .status-bar{padding:6px 12px;background:var(--card);border-top:1px solid var(--border);font-size:0.78rem;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
 .prog-wrap{height:4px;background:#090d14;width:100%;overflow:hidden}
 .prog-bar{height:100%;width:0%;background:var(--green);transition:width 0.15s}
@@ -111,15 +115,29 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
         <span id="edDirty" style="color:var(--amber);font-weight:700;display:none"> *modified</span>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button onclick="toggleHelp()">📖 C-Script API</button>
-        <button onclick="loadTemplate()">✨ Demo .c</button>
-        <button class="btn-accent" onclick="saveCurrentFile(false)">💾 Save (Ctrl+S)</button>
+        <button id="btnWall" class="btn-amber" style="display:none" onclick="setAsWallpaper()">🖼 Set Console Wallpaper</button>
+        <button id="btnDlImg" style="display:none" onclick="downloadFile(curFile)">⬇ Download Image</button>
+        <button id="btnApi" onclick="toggleHelp()">📖 C-Script API</button>
+        <button id="btnDemo" onclick="loadTemplate()">✨ Demo .c</button>
+        <button id="btnSave" class="btn-accent" onclick="saveCurrentFile(false)">💾 Save (Ctrl+S)</button>
         <button class="btn-green" id="btnSaveRun" onclick="saveCurrentFile(true)">▶ Save & Run on Console</button>
         <button class="btn-red" onclick="stopApp()">⏹ Stop App</button>
       </div>
     </div>
-    <div class="editor-wrap">
-      <textarea id="codeArea" spellcheck="false" placeholder="Select any .c, .h, .txt, .md, .ini, .cfg, .log file on the left to view/edit, or click [+ File] / [✨ Demo .c]..."></textarea>
+    <div class="editor-wrap" id="editorWrap">
+      <textarea id="codeArea" spellcheck="false" placeholder="Select any .c, .h, .txt, .md, .ini, .cfg, .log file on the left to view/edit, or click an image (.bmp, .png, .jpg) to preview..."></textarea>
+    </div>
+    <div class="img-viewer" id="imgWrap">
+      <div class="img-stage">
+        <img id="previewImg" alt="SD Image Preview">
+      </div>
+      <div class="img-meta" id="imgMeta">--</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button onclick="setImgZoom(1)">1× Actual</button>
+        <button onclick="setImgZoom(2)">2× Pixel Art</button>
+        <button onclick="setImgZoom(4)">4× Icon Zoom</button>
+        <button onclick="setImgZoom(0)">Fit Window</button>
+      </div>
     </div>
     <div id="helpBox" class="help-box">
       <b style="color:var(--accent)">C-Script Built-in Functions:</b><br>
@@ -141,6 +159,7 @@ let curFile = '';
 let isDirty = false;
 let themeLockUntil = 0;
 const EDIT_EXTS = ['.c','.h','.txt','.md','.ini','.cfg','.log','.json','.csv'];
+const IMG_EXTS  = ['.bmp','.png','.jpg','.jpeg','.gif','.sjpg'];
 
 function setStatus(msg, color){
   const el = document.getElementById('statusMsg');
@@ -153,6 +172,21 @@ function setProgress(pct){
 function isEditable(name){
   const lower = name.toLowerCase();
   return EDIT_EXTS.some(ext => lower.endsWith(ext));
+}
+function isImage(name){
+  const lower = name.toLowerCase();
+  return IMG_EXTS.some(ext => lower.endsWith(ext));
+}
+function showPaneMode(mode){
+  const isImg = (mode === 'image');
+  document.getElementById('editorWrap').style.display = isImg ? 'none' : 'flex';
+  document.getElementById('imgWrap').style.display    = isImg ? 'flex' : 'none';
+  document.getElementById('btnWall').style.display    = isImg ? 'inline-flex' : 'none';
+  document.getElementById('btnDlImg').style.display   = isImg ? 'inline-flex' : 'none';
+  document.getElementById('btnApi').style.display     = isImg ? 'none' : 'inline-flex';
+  document.getElementById('btnDemo').style.display    = isImg ? 'none' : 'inline-flex';
+  document.getElementById('btnSave').style.display    = isImg ? 'none' : 'inline-flex';
+  document.getElementById('btnSaveRun').style.display = isImg ? 'none' : 'inline-flex';
 }
 function isRunnable(name){
   const lower = name.toLowerCase();
@@ -202,9 +236,11 @@ async function loadDir(path){
   try{
     const r = await fetch('/api/fs/list?path=' + encodeURIComponent(curDir));
     const d = await r.json();
-    const box = document.getElementById('fileList');
-    box.innerHTML = '';
-    if(!d.ok){
+    coconst icon = item.dir ? '📁 ' : (isImage(item.name) ? '🖼 ' : (isEditable(item.name) ? '📄 ' : '📦 '));
+      nameEl.innerHTML = icon + item.name;
+      nameEl.onclick = () => {
+        if(item.dir) loadDir(full);
+        else if(isImage(item.name)) openImageInViewer(full, item.size
       box.innerHTML = '<div style="padding:14px;color:var(--red)">SD directory read error or STM32 busy.</div>';
       setStatus('Failed to list directory.', 'var(--red)');
       return;
@@ -277,8 +313,7 @@ function goUp(){
   loadDir(idx <= 0 ? '/' : curDir.substring(0, idx));
 }
 
-async function openFileInEditor(path){
-  if(isDirty && !confirm('Discard unsaved changes in ' + curFile + '?')) return;
+asyhowPaneMode('editor');
   setStatus('Reading ' + path + ' from STM32 SD...');
   setProgress(35);
   try{
@@ -301,6 +336,65 @@ async function openFileInEditor(path){
     loadDir(curDir);
   }catch(e){
     setProgress(0);
+    setStatus('Error reading file', 'var(--red)');
+  }
+}
+
+let natW = 0, natH = 0;
+function setImgZoom(scale){
+  const img = document.getElementById('previewImg');
+  if(!natW || !natH) return;
+  if(scale === 0){
+    img.style.width = '';
+    img.style.height = '';
+    img.style.maxWidth = '100%';
+    img.style.maxHeight = '58vh';
+  } else {
+    img.style.maxWidth = 'none';
+    img.style.maxHeight = 'none';
+    img.style.width  = (natW * scale) + 'px';
+    img.style.height = (natH * scale) + 'px';
+  }
+}
+
+function openImageInViewer(path, byteSize){
+  if(isDirty && !confirm('Discard unsaved changes in ' + curFile + '?')) return;
+  isDirty = false;
+  curFile = path;
+  showPaneMode('image');
+  document.getElementById('edFileTitle').textContent = '🖼 ' + path;
+  document.getElementById('edDirty').style.display = 'none';
+  document.getElementById('imgMeta').textContent = 'Loading image from SD...';
+  setStatus('Loading image ' + path + '...');
+  setProgress(40);
+
+  const img = document.getElementById('previewImg');
+  img.onload = () => {
+    natW = img.naturalWidth;
+    natH = img.naturalHeight;
+    setImgZoom(natW <= 96 ? 3 : (natW <= 320 ? 2 : 0));
+    document.getElementById('imgMeta').textContent =
+      path + '  —  ' + natW + ' × ' + natH + ' px  (' + formatBytes(byteSize || 0) + ')';
+    document.getElementById('cursorInfo').textContent = natW + '×' + natH + ' px';
+    setProgress(100);
+    setTimeout(() => setProgress(0), 350);
+    setStatus('Loaded image ' + path, 'var(--green)');
+  };
+  img.onerror = () => {
+    setProgress(0);
+    document.getElementById('imgMeta').textContent = 'Failed to decode image';
+    setStatus('Failed to load image ' + path, 'var(--red)');
+  };
+  img.src = '/api/fs/read?path=' + encodeURIComponent(path) + '&t=' + Date.now();
+  loadDir(curDir);
+}
+
+async function setAsWallpaper(){
+  if(!curFile) return;
+  setStatus('Applying ' + curFile + ' as Console desktop wallpaper...', 'var(--amber)');
+  const r = await fetch('/api/wallpaper?path=' + encodeURIComponent(curFile), {method:'POST'});
+  if(r.ok) setStatus('Wallpaper updated on Console: ' + curFile, 'var(--green)');
+  else setStatus('Failed to set wallpaper', 'var(--red)'); setProgress(0);
     setStatus('Error reading file', 'var(--red)');
   }
 }
@@ -388,6 +482,7 @@ function downloadFile(path){
 async function createNewFile(){
   const name = prompt('New file name (.c, .txt, .md, .ini, .cfg, .h):', 'new_script.c');
   if(!name) return;
+  showPaneMode('editor');
   const full = joinPath(curDir, name);
   curFile = full;
   document.getElementById('codeArea').value = name.endsWith('.c')
@@ -455,6 +550,7 @@ function toggleHelp(){
 
 function loadTemplate(){
   if(isDirty && !confirm('Replace editor content with C-Script template?')) return;
+  showPaneMode('editor');
   if(!curFile || !curFile.endsWith('.c')) curFile = joinPath(curDir === '/' ? '/games' : curDir, 'web_demo.c');
   document.getElementById('edFileTitle').textContent = '📝 ' + curFile;
   document.getElementById('codeArea').value =

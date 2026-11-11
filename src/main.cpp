@@ -24,10 +24,10 @@
 #define RGB_LED_PIN     8
 #define BOOT_BTN_PIN    9
 
-/* UART1 Link to STM32F407 Console (P11 Header: PA0=TX -> GP19, PA1=RX <- GP18) */
+/* UART1 Link to STM32F407 Console (P13 Header: PC6=TX -> GP19, PC7=RX <- GP18) */
 #define STM32_UART_TX   18
 #define STM32_UART_RX   19
-#define STM32_UART_BAUD 115200
+#define STM32_UART_BAUD 921600
 
 /* 1.47" ST7789 Panel Geometry in Landscape (320 x 172, Y-offset = 34) */
 #define LCD_W           320
@@ -111,14 +111,14 @@ static char     s_wth_city[24]   = "Auto";
 static float    s_wth_lat        = 0.0f;
 static float    s_wth_lon        = 0.0f;
 
-static char     s_rx_line[384];
+static char     s_rx_line[1152];
 static uint16_t s_rx_line_len    = 0;
 
 static WebServer s_web(80);
 static bool      s_mdns_started  = false;
 static uint32_t  s_theme_lock_until = 0;
 
-/* RPC synchronization state for SD File & App operations over UART4 */
+/* RPC synchronization state for SD File & App operations over USART6 */
 static bool      s_rpc_ls_done   = false;
 static bool      s_rpc_ls_ok     = false;
 static String    s_rpc_ls_json   = "";
@@ -130,7 +130,7 @@ static bool      s_rpc_rd_done   = false;
 static bool      s_rpc_rd_ok     = false;
 static uint32_t  s_rpc_rd_total  = 0;
 static uint16_t  s_rpc_rd_len    = 0;
-static uint8_t   s_rpc_rd_buf[128];
+static uint8_t   s_rpc_rd_buf[512];
 
 /* ==========================================================================
  * Compact 5x7 ASCII Font (0x20..0x7E)
@@ -407,7 +407,7 @@ static void render_screen_esp32_net(void)
     }
 
     /* Bottom Card: USART6 Link Activity & ESP32-C6 Memory Breakdown */
-    snprintf(line, sizeof(line), "Link:  %-8s | 115200 8N1 PC6/PC7",
+    snprintf(line, sizeof(line), "Link:  %-8s | 921600 8N1 PC6/PC7",
              s_stm32_online ? "ONLINE" : "WAITING");
     lcd_draw_text(18, 98, line, s_stm32_online ? COL_GREEN : RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
 
@@ -964,13 +964,26 @@ static void stm32_uart_init(void)
     cfg.parity     = UART_PARITY_DISABLE;
     cfg.stop_bits  = UART_STOP_BITS_1;
     cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
-    cfg.source_clk = UART_SCLK_XTAL;
+    cfg.source_clk = UART_SCLK_DEFAULT;
 
-    (void)uart_driver_install(UART_NUM_1, 2048, 1024, 0, NULL, 0);
+    (void)uart_driver_install(UART_NUM_1, 4096, 2048, 0, NULL, 0);
     (void)uart_param_config(UART_NUM_1, &cfg);
     (void)uart_set_pin(UART_NUM_1, STM32_UART_TX, STM32_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     (void)gpio_set_drive_capability((gpio_num_t)STM32_UART_TX, GPIO_DRIVE_CAP_3);
     (void)gpio_set_pull_mode((gpio_num_t)STM32_UART_RX, GPIO_PULLUP_ONLY);
+}
+
+static const char *guess_mime_type(const String &path, bool is_dl)
+{
+    if (is_dl) return "application/octet-stream";
+    String low = path;
+    low.toLowerCase();
+    if (low.endsWith(".bmp"))  return "image/bmp";
+    if (low.endsWith(".png"))  return "image/png";
+    if (low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".sjpg")) return "image/jpeg";
+    if (low.endsWith(".gif"))  return "image/gif";
+    if (low.endsWith(".json")) return "application/json; charset=utf-8";
+    return "text/plain; charset=utf-8";
 }
 
 static void stm32_uart_send(const char *str)
@@ -1091,11 +1104,11 @@ static void web_setup_routes(void)
             return;
         }
 
-        /* Read first chunk to verify file exists and obtain total size */
+        /* Read first 512-byte chunk to verify file exists and obtain total size */
         s_rpc_rd_done = false;
         s_rpc_rd_ok   = false;
         char cmd[192];
-        snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,0,128\n", path.c_str());
+        snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,0,512\n", path.c_str());
         stm32_uart_send(cmd);
         s_uart_tx_cnt++;
 
@@ -1120,7 +1133,7 @@ static void web_setup_routes(void)
             s_web.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
         }
         s_web.setContentLength(total);
-        s_web.send(200, is_dl ? "application/octet-stream" : "text/plain; charset=utf-8", "");
+        s_web.send(200, guess_mime_type(path, is_dl), "");
 
         if (s_rpc_rd_len > 0)
         {
@@ -1132,7 +1145,7 @@ static void web_setup_routes(void)
         {
             s_rpc_rd_done = false;
             s_rpc_rd_ok   = false;
-            snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,%lu,128\n", path.c_str(), (unsigned long)offset);
+            snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,%lu,512\n", path.c_str(), (unsigned long)offset);
             stm32_uart_send(cmd);
             s_uart_tx_cnt++;
 
@@ -1165,7 +1178,7 @@ static void web_setup_routes(void)
         const char *hex_ptr = hex_body.c_str();
         size_t total_hex = hex_body.length() & ~1U;
 
-        char frame[340];
+        char frame[1120];
 
         if (total_hex == 0)
         {
@@ -1187,7 +1200,7 @@ static void web_setup_routes(void)
         while (off < total_hex)
         {
             size_t chunk_hex = total_hex - off;
-            if (chunk_hex > 192U) chunk_hex = 192U; /* 96 raw bytes = 192 hex chars */
+            if (chunk_hex > 960U) chunk_hex = 960U; /* 480 raw bytes = 960 hex chars */
             char m = (off == 0) ? mode[0] : 'A';
 
             int hdr = snprintf(frame, sizeof(frame), "ESP32:FS_WR,%s,%c,", path.c_str(), m);
@@ -1265,6 +1278,17 @@ static void web_setup_routes(void)
         s_rpc_ack_done = false;
         s_rpc_ack_ok   = false;
         stm32_uart_send("ESP32:APP_STOP\n");
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1500U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/wallpaper", HTTP_POST, []() {
+        String path = s_web.arg("path");
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        String cmd = "ESP32:SET_WALL," + path + "\n";
+        stm32_uart_send(cmd.c_str());
         s_uart_tx_cnt++;
         bool ok = rpc_wait_ack(1500U);
         s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
