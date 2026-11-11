@@ -116,6 +116,7 @@ static uint16_t s_rx_line_len    = 0;
 
 static WebServer s_web(80);
 static bool      s_mdns_started  = false;
+static uint32_t  s_theme_lock_until = 0;
 
 /* RPC synchronization state for SD File & App operations over UART4 */
 static bool      s_rpc_ls_done   = false;
@@ -766,12 +767,14 @@ static uint8_t hex_nibble(char c)
 
 static void handle_stm32_packet(const char *pkt)
 {
+    const char *p_cmd = NULL;
+
     /* 0. File & App RPC replies from STM32 */
-    if (strncmp(pkt, "STM32:FLS_I,", 12) == 0)
+    if ((p_cmd = strstr(pkt, "FLS_I,")) != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
-        const char *p = pkt + 12;
+        const char *p = p_cmd + 6;
         char type_ch = p[0];
         const char *c1 = strchr(p, ',');
         if (c1 != NULL)
@@ -797,19 +800,19 @@ static void handle_stm32_packet(const char *pkt)
         }
         return;
     }
-    if (strncmp(pkt, "STM32:FLS_END,", 14) == 0)
+    if ((p_cmd = strstr(pkt, "FLS_END,")) != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
-        s_rpc_ls_ok   = (strncmp(pkt + 14, "OK", 2) == 0);
+        s_rpc_ls_ok   = (strncmp(p_cmd + 8, "OK", 2) == 0);
         s_rpc_ls_done = true;
         return;
     }
-    if (strncmp(pkt, "STM32:FRD,", 10) == 0)
+    if ((p_cmd = strstr(pkt, "FRD,")) != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
-        const char *c1 = strchr(pkt + 10, ',');
+        const char *c1 = strchr(p_cmd + 4, ',');
         if (c1 != NULL)
         {
             uint16_t rlen = (uint16_t)strtoul(c1 + 1, NULL, 10);
@@ -837,7 +840,7 @@ static void handle_stm32_packet(const char *pkt)
         s_rpc_rd_done = true;
         return;
     }
-    if (strncmp(pkt, "STM32:FRD_ERR", 13) == 0)
+    if (strstr(pkt, "FRD_ERR") != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
@@ -845,7 +848,7 @@ static void handle_stm32_packet(const char *pkt)
         s_rpc_rd_done = true;
         return;
     }
-    if (strncmp(pkt, "STM32:FOK", 9) == 0)
+    if (strstr(pkt, "FOK") != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
@@ -853,7 +856,7 @@ static void handle_stm32_packet(const char *pkt)
         s_rpc_ack_done = true;
         return;
     }
-    if (strncmp(pkt, "STM32:FERR", 10) == 0)
+    if (strstr(pkt, "FERR") != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
@@ -862,12 +865,12 @@ static void handle_stm32_packet(const char *pkt)
         return;
     }
 
-    if (strncmp(pkt, "STM32:REQ_WTH", 13) == 0)
+    if (strstr(pkt, "REQ_WTH") != NULL)
     {
         s_wth_req_now = true;
         return;
     }
-    if (strncmp(pkt, "STM32:HB", 8) == 0)
+    if (strstr(pkt, "STM32:HB") != NULL || strstr(pkt, ":HB,") != NULL)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
@@ -893,7 +896,7 @@ static void handle_stm32_packet(const char *pkt)
         if (p) s_stm32_text = (int32_t)strtol(p + 5, NULL, 10);
 
         p = strstr(pkt, "THM=");
-        if (p)
+        if (p && (int32_t)(millis() - s_theme_lock_until) >= 0)
         {
             uint8_t thm = (uint8_t)atoi(p + 4);
             if (thm < 4 && thm != s_theme_idx)
@@ -975,8 +978,10 @@ static void stm32_uart_send(const char *str)
     if (str != NULL)
     {
         size_t len = strlen(str);
+        /* Prepend newline to flush any line noise on STM32 RX before our command */
+        (void)uart_write_bytes(UART_NUM_1, "\n", 1);
         (void)uart_write_bytes(UART_NUM_1, str, len);
-        s_uart_tx_bytes += (uint32_t)len;
+        s_uart_tx_bytes += (uint32_t)(len + 1U);
     }
 }
 
@@ -1050,31 +1055,31 @@ static void web_setup_routes(void)
         String path = s_web.arg("path");
         if (path.length() == 0) path = "/";
 
-        s_rpc_ls_done = false;
-        s_rpc_ls_ok   = false;
-        s_rpc_ls_json = "[";
-
         String cmd = "ESP32:FS_LS," + path + "\n";
-        stm32_uart_send(cmd.c_str());
-        s_uart_tx_cnt++;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            s_rpc_ls_done = false;
+            s_rpc_ls_ok   = false;
+            s_rpc_ls_json = "[";
 
-        uint32_t t0 = millis();
-        while (!s_rpc_ls_done && (millis() - t0) < 2500U)
-        {
-            poll_stm32_uart();
-            delay(1);
-        }
-        s_rpc_ls_json += "]";
+            stm32_uart_send(cmd.c_str());
+            s_uart_tx_cnt++;
 
-        if (s_rpc_ls_done && s_rpc_ls_ok)
-        {
-            String out = "{\"ok\":true,\"path\":\"" + path + "\",\"items\":" + s_rpc_ls_json + "}";
-            s_web.send(200, "application/json", out);
+            uint32_t t0 = millis();
+            while (!s_rpc_ls_done && (millis() - t0) < 1500U)
+            {
+                poll_stm32_uart();
+                delay(1);
+            }
+            if (s_rpc_ls_done && s_rpc_ls_ok)
+            {
+                s_rpc_ls_json += "]";
+                String out = "{\"ok\":true,\"path\":\"" + path + "\",\"items\":" + s_rpc_ls_json + "}";
+                s_web.send(200, "application/json", out);
+                return;
+            }
         }
-        else
-        {
-            s_web.send(200, "application/json", "{\"ok\":false,\"items\":[]}");
-        }
+        s_web.send(200, "application/json", "{\"ok\":false,\"items\":[]}");
     });
 
     s_web.on("/api/fs/read", HTTP_GET, []() {
@@ -1270,12 +1275,20 @@ static void web_setup_routes(void)
         if (id >= 0 && id < 4)
         {
             s_theme_idx = (uint8_t)id;
+            s_theme_lock_until = millis() + 2500U;
             draw_static_ui();
             update_dynamic_ui();
+
             char cmd[32];
             snprintf(cmd, sizeof(cmd), "ESP32:SET_THM=%u\n", (unsigned int)s_theme_idx);
-            stm32_uart_send(cmd);
-            s_uart_tx_cnt++;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                s_rpc_ack_done = false;
+                s_rpc_ack_ok   = false;
+                stm32_uart_send(cmd);
+                s_uart_tx_cnt++;
+                if (rpc_wait_ack(500U)) break;
+            }
         }
         s_web.send(200, "application/json", "{\"ok\":true}");
     });

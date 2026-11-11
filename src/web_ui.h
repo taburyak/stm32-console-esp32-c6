@@ -139,6 +139,7 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
 let curDir = '/';
 let curFile = '';
 let isDirty = false;
+let themeLockUntil = 0;
 const EDIT_EXTS = ['.c','.h','.txt','.md','.ini','.cfg','.log','.json','.csv'];
 
 function setStatus(msg, color){
@@ -190,7 +191,7 @@ async function pollStatus(){
       document.getElementById('tOut').textContent = 'Syncing...';
     }
     const sel = document.getElementById('thmSel');
-    if(document.activeElement !== sel) sel.value = String(d.theme || 0);
+    if(document.activeElement !== sel && Date.now() > themeLockUntil) sel.value = String(d.theme || 0);
   }catch(e){}
 }
 
@@ -442,6 +443,7 @@ async function stopApp(){
 }
 
 async function setTheme(id){
+  themeLockUntil = Date.now() + 2500;
   await fetch('/api/theme?id=' + id, {method:'POST'});
   setStatus('Switched console theme.');
 }
