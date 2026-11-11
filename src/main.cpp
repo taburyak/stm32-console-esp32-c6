@@ -1,11 +1,14 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <time.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "web_ui.h"
 
 /* ==========================================================================
  * ESP32-C6-LCD-1.47 Onboard Pin Definitions
@@ -108,8 +111,25 @@ static char     s_wth_city[24]   = "Auto";
 static float    s_wth_lat        = 0.0f;
 static float    s_wth_lon        = 0.0f;
 
-static char     s_rx_line[128];
+static char     s_rx_line[384];
 static uint16_t s_rx_line_len    = 0;
+
+static WebServer s_web(80);
+static bool      s_mdns_started  = false;
+
+/* RPC synchronization state for SD File & App operations over UART4 */
+static bool      s_rpc_ls_done   = false;
+static bool      s_rpc_ls_ok     = false;
+static String    s_rpc_ls_json   = "";
+
+static bool      s_rpc_ack_done  = false;
+static bool      s_rpc_ack_ok    = false;
+
+static bool      s_rpc_rd_done   = false;
+static bool      s_rpc_rd_ok     = false;
+static uint32_t  s_rpc_rd_total  = 0;
+static uint16_t  s_rpc_rd_len    = 0;
+static uint8_t   s_rpc_rd_buf[128];
 
 /* ==========================================================================
  * Compact 5x7 ASCII Font (0x20..0x7E)
@@ -364,12 +384,16 @@ static void render_screen_esp32_net(void)
         snprintf(line, sizeof(line), "IPv4:  %-15s Ch:%-2d        ",
                  WiFi.localIP().toString().c_str(), (int)WiFi.channel());
         lcd_draw_text(18, 52, line, COL_YELLOW, COL_CARD, 1);
+
+        lcd_draw_text(18, 68, "Web:   http://stm32-console.local   ", RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
     }
     else if (s_wifi_connecting)
     {
         snprintf(line, sizeof(line), "WiFi:  [CONNECTING...] %-14s", s_wifi_ssid.c_str());
         lcd_draw_text(18, 36, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
         lcd_draw_text(18, 52, "IPv4:  Waiting DHCP...              ", COL_GRAY, COL_CARD, 1);
+        snprintf(line, sizeof(line), "MAC:   %-17s [BOOT:Page]", WiFi.macAddress().c_str());
+        lcd_draw_text(18, 68, line, COL_WHITE, COL_CARD, 1);
     }
     else
     {
@@ -377,10 +401,9 @@ static void render_screen_esp32_net(void)
                  s_wifi_ssid.length() > 0 ? s_wifi_ssid.c_str() : "Not configured");
         lcd_draw_text(18, 36, line, RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
         lcd_draw_text(18, 52, "IPv4:  0.0.0.0                      ", COL_GRAY, COL_CARD, 1);
+        snprintf(line, sizeof(line), "MAC:   %-17s [BOOT:Page]", WiFi.macAddress().c_str());
+        lcd_draw_text(18, 68, line, COL_WHITE, COL_CARD, 1);
     }
-
-    snprintf(line, sizeof(line), "MAC:   %-17s [BOOT:Page]", WiFi.macAddress().c_str());
-    lcd_draw_text(18, 68, line, COL_WHITE, COL_CARD, 1);
 
     /* Bottom Card: UART4 Link Activity & ESP32-C6 Memory Breakdown */
     snprintf(line, sizeof(line), "Link:  %-8s | 115200 8N1 PA0/PA1",
@@ -733,8 +756,112 @@ static void fetch_weather_now(void)
     }
 }
 
+static uint8_t hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+    if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+    if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+    return 0U;
+}
+
 static void handle_stm32_packet(const char *pkt)
 {
+    /* 0. File & App RPC replies from STM32 */
+    if (strncmp(pkt, "STM32:FLS_I,", 12) == 0)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        const char *p = pkt + 12;
+        char type_ch = p[0];
+        const char *c1 = strchr(p, ',');
+        if (c1 != NULL)
+        {
+            uint32_t fsz = (uint32_t)strtoul(c1 + 1, NULL, 10);
+            const char *c2 = strchr(c1 + 1, ',');
+            if (c2 != NULL)
+            {
+                const char *fname = c2 + 1;
+                if (s_rpc_ls_json.length() > 1) s_rpc_ls_json += ",";
+                s_rpc_ls_json += "{\"name\":\"";
+                for (const char *s = fname; *s != '\0'; s++)
+                {
+                    if (*s == '"' || *s == '\\') s_rpc_ls_json += '\\';
+                    s_rpc_ls_json += *s;
+                }
+                s_rpc_ls_json += "\",\"dir\":";
+                s_rpc_ls_json += (type_ch == 'D') ? "true" : "false";
+                s_rpc_ls_json += ",\"size\":";
+                s_rpc_ls_json += String(fsz);
+                s_rpc_ls_json += "}";
+            }
+        }
+        return;
+    }
+    if (strncmp(pkt, "STM32:FLS_END,", 14) == 0)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_rpc_ls_ok   = (strncmp(pkt + 14, "OK", 2) == 0);
+        s_rpc_ls_done = true;
+        return;
+    }
+    if (strncmp(pkt, "STM32:FRD,", 10) == 0)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        const char *c1 = strchr(pkt + 10, ',');
+        if (c1 != NULL)
+        {
+            uint16_t rlen = (uint16_t)strtoul(c1 + 1, NULL, 10);
+            const char *c2 = strchr(c1 + 1, ',');
+            if (c2 != NULL)
+            {
+                s_rpc_rd_total = (uint32_t)strtoul(c2 + 1, NULL, 10);
+                const char *c3 = strchr(c2 + 1, ',');
+                if (c3 != NULL)
+                {
+                    const char *hex = c3 + 1;
+                    if (rlen > sizeof(s_rpc_rd_buf)) rlen = sizeof(s_rpc_rd_buf);
+                    for (uint16_t i = 0; i < rlen; i++)
+                    {
+                        s_rpc_rd_buf[i] = (uint8_t)((hex_nibble(hex[i * 2]) << 4) | hex_nibble(hex[i * 2 + 1]));
+                    }
+                    s_rpc_rd_len  = rlen;
+                    s_rpc_rd_ok   = true;
+                    s_rpc_rd_done = true;
+                    return;
+                }
+            }
+        }
+        s_rpc_rd_ok   = false;
+        s_rpc_rd_done = true;
+        return;
+    }
+    if (strncmp(pkt, "STM32:FRD_ERR", 13) == 0)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_rpc_rd_ok   = false;
+        s_rpc_rd_done = true;
+        return;
+    }
+    if (strncmp(pkt, "STM32:FOK", 9) == 0)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_rpc_ack_ok   = true;
+        s_rpc_ack_done = true;
+        return;
+    }
+    if (strncmp(pkt, "STM32:FERR", 10) == 0)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_rpc_ack_ok   = false;
+        s_rpc_ack_done = true;
+        return;
+    }
+
     if (strncmp(pkt, "STM32:REQ_WTH", 13) == 0)
     {
         s_wth_req_now = true;
@@ -836,7 +963,7 @@ static void stm32_uart_init(void)
     cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
     cfg.source_clk = UART_SCLK_XTAL;
 
-    (void)uart_driver_install(UART_NUM_1, 512, 512, 0, NULL, 0);
+    (void)uart_driver_install(UART_NUM_1, 2048, 1024, 0, NULL, 0);
     (void)uart_param_config(UART_NUM_1, &cfg);
     (void)uart_set_pin(UART_NUM_1, STM32_UART_TX, STM32_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     (void)gpio_set_drive_capability((gpio_num_t)STM32_UART_TX, GPIO_DRIVE_CAP_3);
@@ -853,6 +980,309 @@ static void stm32_uart_send(const char *str)
     }
 }
 
+static void poll_stm32_uart(void)
+{
+    uint8_t rx_buf[128];
+    int rx_len = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), 0);
+    for (int i = 0; i < rx_len; i++)
+    {
+        char c = (char)rx_buf[i];
+        s_uart_rx_bytes++;
+
+        if (c == '\n' || c == '\r')
+        {
+            if (s_rx_line_len > 0)
+            {
+                s_rx_line[s_rx_line_len] = '\0';
+                handle_stm32_packet(s_rx_line);
+                s_rx_line_len = 0;
+            }
+        }
+        else if (s_rx_line_len < (sizeof(s_rx_line) - 1))
+        {
+            s_rx_line[s_rx_line_len++] = c;
+        }
+    }
+}
+
+static bool rpc_wait_ack(uint32_t timeout_ms)
+{
+    uint32_t t0 = millis();
+    while (!s_rpc_ack_done && (millis() - t0) < timeout_ms)
+    {
+        poll_stm32_uart();
+        delay(1);
+    }
+    return s_rpc_ack_done && s_rpc_ack_ok;
+}
+
+static void web_setup_routes(void)
+{
+    s_web.on("/", HTTP_GET, []() {
+        s_web.send_P(200, "text/html; charset=utf-8", kWebUiHtml);
+    });
+
+    s_web.on("/api/status", HTTP_GET, []() {
+        char json[384];
+        snprintf(json, sizeof(json),
+                 "{\"stm32_online\":%s,\"app\":\"%s\",\"tmcu_deci\":%ld,\"text_deci\":%ld,"
+                 "\"stm32_heap_kb\":%lu,\"stm32_min_heap_kb\":%lu,\"theme\":%u,"
+                 "\"wifi_ssid\":\"%s\",\"wifi_ip\":\"%s\",\"wifi_rssi\":%d,"
+                 "\"esp_heap_kb\":%lu,\"tx_cnt\":%lu,\"rx_cnt\":%lu,"
+                 "\"wth_valid\":%s,\"wth_city\":\"%s\",\"wth_t_deci\":%d,\"wth_fl_deci\":%d,\"wth_hum\":%u,\"wth_wind_deci\":%u}",
+                 s_stm32_online ? "true" : "false",
+                 s_stm32_app,
+                 (long)s_stm32_tmcu, (long)s_stm32_text,
+                 (unsigned long)s_stm32_heap, (unsigned long)s_stm32_min_heap,
+                 (unsigned int)s_theme_idx,
+                 s_wifi_ssid.c_str(),
+                 (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "0.0.0.0",
+                 (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
+                 (unsigned long)(ESP.getFreeHeap() / 1024UL),
+                 (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt,
+                 s_wth_valid ? "true" : "false",
+                 s_wth_city, (int)s_wth_t_deci, (int)s_wth_fl_deci,
+                 (unsigned int)s_wth_hum, (unsigned int)s_wth_wind_deci);
+        s_web.send(200, "application/json", json);
+    });
+
+    s_web.on("/api/fs/list", HTTP_GET, []() {
+        String path = s_web.arg("path");
+        if (path.length() == 0) path = "/";
+
+        s_rpc_ls_done = false;
+        s_rpc_ls_ok   = false;
+        s_rpc_ls_json = "[";
+
+        String cmd = "ESP32:FS_LS," + path + "\n";
+        stm32_uart_send(cmd.c_str());
+        s_uart_tx_cnt++;
+
+        uint32_t t0 = millis();
+        while (!s_rpc_ls_done && (millis() - t0) < 2500U)
+        {
+            poll_stm32_uart();
+            delay(1);
+        }
+        s_rpc_ls_json += "]";
+
+        if (s_rpc_ls_done && s_rpc_ls_ok)
+        {
+            String out = "{\"ok\":true,\"path\":\"" + path + "\",\"items\":" + s_rpc_ls_json + "}";
+            s_web.send(200, "application/json", out);
+        }
+        else
+        {
+            s_web.send(200, "application/json", "{\"ok\":false,\"items\":[]}");
+        }
+    });
+
+    s_web.on("/api/fs/read", HTTP_GET, []() {
+        String path = s_web.arg("path");
+        bool is_dl  = (s_web.arg("dl") == "1");
+        if (path.length() == 0)
+        {
+            s_web.send(400, "text/plain", "Missing path");
+            return;
+        }
+
+        /* Read first chunk to verify file exists and obtain total size */
+        s_rpc_rd_done = false;
+        s_rpc_rd_ok   = false;
+        char cmd[192];
+        snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,0,128\n", path.c_str());
+        stm32_uart_send(cmd);
+        s_uart_tx_cnt++;
+
+        uint32_t t0 = millis();
+        while (!s_rpc_rd_done && (millis() - t0) < 1500U)
+        {
+            poll_stm32_uart();
+            delay(1);
+        }
+
+        if (!s_rpc_rd_done || !s_rpc_rd_ok)
+        {
+            s_web.send(404, "text/plain", "File not found on SD");
+            return;
+        }
+
+        uint32_t total = s_rpc_rd_total;
+        if (is_dl)
+        {
+            int sl = path.lastIndexOf('/');
+            String fname = (sl >= 0) ? path.substring(sl + 1) : path;
+            s_web.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
+        }
+        s_web.setContentLength(total);
+        s_web.send(200, is_dl ? "application/octet-stream" : "text/plain; charset=utf-8", "");
+
+        if (s_rpc_rd_len > 0)
+        {
+            s_web.client().write(s_rpc_rd_buf, s_rpc_rd_len);
+        }
+
+        uint32_t offset = s_rpc_rd_len;
+        while (offset < total)
+        {
+            s_rpc_rd_done = false;
+            s_rpc_rd_ok   = false;
+            snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,%lu,128\n", path.c_str(), (unsigned long)offset);
+            stm32_uart_send(cmd);
+            s_uart_tx_cnt++;
+
+            t0 = millis();
+            while (!s_rpc_rd_done && (millis() - t0) < 1500U)
+            {
+                poll_stm32_uart();
+                delay(1);
+            }
+            if (!s_rpc_rd_done || !s_rpc_rd_ok || s_rpc_rd_len == 0)
+            {
+                break;
+            }
+            s_web.client().write(s_rpc_rd_buf, s_rpc_rd_len);
+            offset += s_rpc_rd_len;
+        }
+    });
+
+    s_web.on("/api/fs/write", HTTP_POST, []() {
+        String path = s_web.arg("path");
+        String mode = s_web.arg("mode");
+        if (path.length() == 0)
+        {
+            s_web.send(400, "application/json", "{\"ok\":false}");
+            return;
+        }
+        if (mode.length() == 0) mode = "W";
+
+        String hex_body = s_web.arg("plain");
+        const char *hex_ptr = hex_body.c_str();
+        size_t total_hex = hex_body.length() & ~1U;
+
+        char frame[340];
+
+        if (total_hex == 0)
+        {
+            s_rpc_ack_done = false;
+            s_rpc_ack_ok   = false;
+            snprintf(frame, sizeof(frame), "ESP32:FS_WR,%s,%c,\n", path.c_str(), mode[0]);
+            stm32_uart_send(frame);
+            s_uart_tx_cnt++;
+            if (!rpc_wait_ack(1500U))
+            {
+                s_web.send(500, "application/json", "{\"ok\":false}");
+                return;
+            }
+            s_web.send(200, "application/json", "{\"ok\":true}");
+            return;
+        }
+
+        size_t off = 0;
+        while (off < total_hex)
+        {
+            size_t chunk_hex = total_hex - off;
+            if (chunk_hex > 192U) chunk_hex = 192U; /* 96 raw bytes = 192 hex chars */
+            char m = (off == 0) ? mode[0] : 'A';
+
+            int hdr = snprintf(frame, sizeof(frame), "ESP32:FS_WR,%s,%c,", path.c_str(), m);
+            if (hdr <= 0 || (size_t)(hdr + chunk_hex + 2U) >= sizeof(frame))
+            {
+                s_web.send(500, "application/json", "{\"ok\":false}");
+                return;
+            }
+            memcpy(frame + hdr, hex_ptr + off, chunk_hex);
+            frame[hdr + chunk_hex]     = '\n';
+            frame[hdr + chunk_hex + 1] = '\0';
+
+            s_rpc_ack_done = false;
+            s_rpc_ack_ok   = false;
+            stm32_uart_send(frame);
+            s_uart_tx_cnt++;
+
+            if (!rpc_wait_ack(1500U))
+            {
+                s_web.send(500, "application/json", "{\"ok\":false}");
+                return;
+            }
+            off += chunk_hex;
+        }
+
+        s_web.send(200, "application/json", "{\"ok\":true}");
+    });
+
+    s_web.on("/api/fs/mkdir", HTTP_POST, []() {
+        String path = s_web.arg("path");
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        String cmd = "ESP32:FS_MKDIR," + path + "\n";
+        stm32_uart_send(cmd.c_str());
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1500U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/fs/delete", HTTP_POST, []() {
+        String path = s_web.arg("path");
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        String cmd = "ESP32:FS_DEL," + path + "\n";
+        stm32_uart_send(cmd.c_str());
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1500U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/fs/rename", HTTP_POST, []() {
+        String o = s_web.arg("old");
+        String n = s_web.arg("new");
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        String cmd = "ESP32:FS_REN," + o + "," + n + "\n";
+        stm32_uart_send(cmd.c_str());
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1500U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/app/run", HTTP_POST, []() {
+        String path = s_web.arg("path");
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        String cmd = "ESP32:APP_RUN," + path + "\n";
+        stm32_uart_send(cmd.c_str());
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1500U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/app/stop", HTTP_POST, []() {
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        stm32_uart_send("ESP32:APP_STOP\n");
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1500U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/theme", HTTP_POST, []() {
+        int id = s_web.arg("id").toInt();
+        if (id >= 0 && id < 4)
+        {
+            s_theme_idx = (uint8_t)id;
+            draw_static_ui();
+            update_dynamic_ui();
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "ESP32:SET_THM=%u\n", (unsigned int)s_theme_idx);
+            stm32_uart_send(cmd);
+            s_uart_tx_cnt++;
+        }
+        s_web.send(200, "application/json", "{\"ok\":true}");
+    });
+
+    s_web.begin();
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -863,6 +1293,7 @@ void setup()
     s_wifi_pass = s_prefs.getString("pass", "");
 
     WiFi.mode(WIFI_STA);
+    WiFi.setHostname("stm32-console");
     if (s_wifi_ssid.length() > 0)
     {
         WiFi.begin(s_wifi_ssid.c_str(), s_wifi_pass.c_str());
@@ -872,10 +1303,11 @@ void setup()
 
     lcd_init();
     stm32_uart_init();
+    web_setup_routes();
     draw_static_ui();
     update_dynamic_ui();
 
-    Serial.println("[ESP32-C6] Companion HUD initialized!");
+    Serial.println("[ESP32-C6] Companion HUD & Web Studio initialized!");
 }
 
 void loop()
@@ -900,26 +1332,21 @@ void loop()
     }
     last_btn = btn;
 
-    uint8_t rx_buf[64];
-    int rx_len = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), 0);
-    for (int i = 0; i < rx_len; i++)
-    {
-        char c = (char)rx_buf[i];
-        s_uart_rx_bytes++;
+    poll_stm32_uart();
+    s_web.handleClient();
 
-        if (c == '\n' || c == '\r')
+    if (WiFi.status() == WL_CONNECTED && !s_mdns_started)
+    {
+        if (MDNS.begin("stm32-console"))
         {
-            if (s_rx_line_len > 0)
-            {
-                s_rx_line[s_rx_line_len] = '\0';
-                handle_stm32_packet(s_rx_line);
-                s_rx_line_len = 0;
-            }
+            MDNS.addService("http", "tcp", 80);
+            s_mdns_started = true;
+            Serial.println("[mDNS] http://stm32-console.local ready");
         }
-        else if (s_rx_line_len < (sizeof(s_rx_line) - 1))
-        {
-            s_rx_line[s_rx_line_len++] = c;
-        }
+    }
+    else if (WiFi.status() != WL_CONNECTED && s_mdns_started)
+    {
+        s_mdns_started = false;
     }
 
     /* Check Wi-Fi state transitions */
