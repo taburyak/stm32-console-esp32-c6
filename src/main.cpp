@@ -406,8 +406,8 @@ static void render_screen_esp32_net(void)
         lcd_draw_text(18, 68, line, COL_WHITE, COL_CARD, 1);
     }
 
-    /* Bottom Card: UART4 Link Activity & ESP32-C6 Memory Breakdown */
-    snprintf(line, sizeof(line), "Link:  %-8s | 115200 8N1 PA0/PA1",
+    /* Bottom Card: USART6 Link Activity & ESP32-C6 Memory Breakdown */
+    snprintf(line, sizeof(line), "Link:  %-8s | 115200 8N1 PC6/PC7",
              s_stm32_online ? "ONLINE" : "WAITING");
     lcd_draw_text(18, 98, line, s_stm32_online ? COL_GREEN : RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
 
@@ -462,7 +462,7 @@ static void render_screen_stm32_console(void)
     else
     {
         lcd_draw_text(18, 36, "State: [WAITING STM32 LINK...]      ", RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
-        lcd_draw_text(18, 52, "Check P11: PA0->GP19, PA1<-GP18     ", COL_WHITE, COL_CARD, 1);
+        lcd_draw_text(18, 52, "Check UART6: PC6->GP19, PC7<-GP18   ", COL_WHITE, COL_CARD, 1);
         lcd_draw_text(18, 68, "Press BOOT button for next screen   ", COL_GRAY, COL_CARD, 1);
     }
 
