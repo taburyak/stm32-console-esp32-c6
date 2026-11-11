@@ -126,6 +126,10 @@ static String    s_rpc_ls_json   = "";
 static bool      s_rpc_ack_done  = false;
 static bool      s_rpc_ack_ok    = false;
 
+static bool      s_rpc_strm_done  = false;
+static bool      s_rpc_strm_ok    = false;
+static uint32_t  s_rpc_strm_total = 0;
+
 static bool      s_rpc_rd_done   = false;
 static bool      s_rpc_rd_ok     = false;
 static uint32_t  s_rpc_rd_total  = 0;
@@ -864,6 +868,23 @@ static void handle_stm32_packet(const char *pkt)
         s_rpc_ack_done = true;
         return;
     }
+    if ((p_cmd = strstr(pkt, "STRM_START,")) != NULL)
+    {
+        s_last_stm32_rx  = millis();
+        s_uart_rx_cnt++;
+        s_rpc_strm_total = (uint32_t)strtoul(p_cmd + 11, NULL, 10);
+        s_rpc_strm_ok    = true;
+        s_rpc_strm_done  = true;
+        return;
+    }
+    if (strstr(pkt, "STRM_ERR") != NULL)
+    {
+        s_last_stm32_rx  = millis();
+        s_uart_rx_cnt++;
+        s_rpc_strm_ok    = false;
+        s_rpc_strm_done  = true;
+        return;
+    }
 
     if (strstr(pkt, "REQ_WTH") != NULL)
     {
@@ -1104,63 +1125,79 @@ static void web_setup_routes(void)
             return;
         }
 
-        /* Read first 512-byte chunk to verify file exists and obtain total size */
-        s_rpc_rd_done = false;
-        s_rpc_rd_ok   = false;
-        char cmd[192];
-        snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,0,512\n", path.c_str());
-        stm32_uart_send(cmd);
+        s_rpc_strm_done  = false;
+        s_rpc_strm_ok    = false;
+        s_rpc_strm_total = 0;
+
+        String cmd = "ESP32:FS_STREAM," + path + "\n";
+        stm32_uart_send(cmd.c_str());
         s_uart_tx_cnt++;
 
         uint32_t t0 = millis();
-        while (!s_rpc_rd_done && (millis() - t0) < 1500U)
+        while (!s_rpc_strm_done && (millis() - t0) < 2500U)
         {
             poll_stm32_uart();
             delay(1);
         }
 
-        if (!s_rpc_rd_done || !s_rpc_rd_ok)
+        if (!s_rpc_strm_done || !s_rpc_strm_ok)
         {
             s_web.send(404, "text/plain", "File not found on SD");
             return;
         }
 
-        uint32_t total = s_rpc_rd_total;
+        uint32_t total = s_rpc_strm_total;
+
         if (is_dl)
         {
             int sl = path.lastIndexOf('/');
             String fname = (sl >= 0) ? path.substring(sl + 1) : path;
             s_web.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
         }
+        else
+        {
+            String low = path;
+            low.toLowerCase();
+            if (low.endsWith(".bmp") || low.endsWith(".png") || low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".gif"))
+            {
+                s_web.sendHeader("Cache-Control", "public, max-age=86400");
+            }
+            else
+            {
+                s_web.sendHeader("Cache-Control", "no-cache");
+            }
+        }
+
         s_web.setContentLength(total);
         s_web.send(200, guess_mime_type(path, is_dl), "");
 
-        if (s_rpc_rd_len > 0)
+        uint32_t remaining = total;
+        uint8_t raw[1024];
+        while (remaining > 0)
         {
-            s_web.client().write(s_rpc_rd_buf, s_rpc_rd_len);
-        }
-
-        uint32_t offset = s_rpc_rd_len;
-        while (offset < total)
-        {
-            s_rpc_rd_done = false;
-            s_rpc_rd_ok   = false;
-            snprintf(cmd, sizeof(cmd), "ESP32:FS_RD,%s,%lu,512\n", path.c_str(), (unsigned long)offset);
-            stm32_uart_send(cmd);
-            s_uart_tx_cnt++;
-
-            t0 = millis();
-            while (!s_rpc_rd_done && (millis() - t0) < 1500U)
+            size_t to_read = (remaining > sizeof(raw)) ? sizeof(raw) : (size_t)remaining;
+            size_t got = 0;
+            uint32_t chunk_t0 = millis();
+            while (got < to_read && (millis() - chunk_t0) < 1500U)
             {
-                poll_stm32_uart();
-                delay(1);
+                int r = uart_read_bytes(UART_NUM_1, raw + got, to_read - got, pdMS_TO_TICKS(40));
+                if (r > 0)
+                {
+                    got += (size_t)r;
+                }
             }
-            if (!s_rpc_rd_done || !s_rpc_rd_ok || s_rpc_rd_len == 0)
+            if (got == 0)
             {
                 break;
             }
-            s_web.client().write(s_rpc_rd_buf, s_rpc_rd_len);
-            offset += s_rpc_rd_len;
+            s_web.client().write(raw, got);
+            remaining -= (uint32_t)got;
+
+            /* Handshake: send 1-byte ACK to STM32 to fetch the next chunk */
+            if (remaining > 0)
+            {
+                uart_write_bytes(UART_NUM_1, "K", 1);
+            }
         }
     });
 
