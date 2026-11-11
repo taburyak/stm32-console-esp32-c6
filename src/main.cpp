@@ -65,9 +65,12 @@ static constexpr uint16_t COL_CARD   = RGB888_TO_565(0x1A, 0x22, 0x34);
 
 static SPIClass s_spi(FSPI);
 static uint8_t  s_theme_idx    = 0;
+static uint8_t  s_screen_idx   = 0; /* 0: Net & Link, 1: Console & Memory, 2: Clock & Weather */
 static uint32_t s_boot_presses = 0;
 static uint32_t s_uart_tx_cnt  = 0;
 static uint32_t s_uart_rx_cnt  = 0;
+static uint32_t s_uart_tx_bytes = 0;
+static uint32_t s_uart_rx_bytes = 0;
 
 static Preferences s_prefs;
 static String   s_wifi_ssid        = "";
@@ -81,8 +84,11 @@ static uint32_t s_last_ntp_poll    = 0;
 static bool     s_stm32_online   = false;
 static uint32_t s_last_stm32_rx  = 0;
 static uint32_t s_stm32_heap     = 0;
+static uint32_t s_stm32_min_heap = 0;
 static int32_t  s_stm32_tmcu     = 0;
 static int32_t  s_stm32_text     = -999;
+static uint32_t s_stm32_sd_free  = 0;
+static uint32_t s_stm32_sd_tot   = 0;
 static char     s_stm32_app[32]  = "connecting...";
 
 /* Weather state (Open-Meteo API) */
@@ -298,50 +304,25 @@ static void lcd_init(void)
 }
 
 /* ==========================================================================
- * Dashboard Rendering
+ * Dashboard Rendering (3 Screens switched via BOOT button)
+ *   Screen 0 [1/3]: Wi-Fi Network, UART4 Link Activity & ESP32-C6 Memory
+ *   Screen 1 [2/3]: STM32F407 Console Telemetry & Memory Layout
+ *   Screen 2 [3/3]: Live Clock, Calendar Date & Open-Meteo Weather
  * ========================================================================== */
-static void update_wifi_card_lines(void)
+static const char *wmo_short_desc(uint8_t wmo)
 {
-    char line[64];
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        snprintf(line, sizeof(line), "WiFi:  [OK] %-14s (%ddBm)   ", s_wifi_ssid.c_str(), (int)WiFi.RSSI());
-        lcd_draw_text(18, 52, line, COL_GREEN, COL_CARD, 1);
-
-        char time_str[20] = "NTP: Syncing";
-        time_t now = time(nullptr);
-        struct tm ti;
-        localtime_r(&now, &ti);
-        if (ti.tm_year >= (2024 - 1900))
-        {
-            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
-        }
-        snprintf(line, sizeof(line), "IP:    %-15s | %-10s", WiFi.localIP().toString().c_str(), time_str);
-        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
-    }
-    else if (s_wifi_connecting)
-    {
-        snprintf(line, sizeof(line), "WiFi:  [CONNECTING...] %-12s   ", s_wifi_ssid.c_str());
-        lcd_draw_text(18, 52, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
-
-        snprintf(line, sizeof(line), "MAC:   %-28s", WiFi.macAddress().c_str());
-        lcd_draw_text(18, 68, line, COL_GRAY, COL_CARD, 1);
-    }
-    else
-    {
-        if (s_wifi_ssid.length() > 0)
-        {
-            snprintf(line, sizeof(line), "WiFi:  [OFFLINE] %-18s", s_wifi_ssid.c_str());
-            lcd_draw_text(18, 52, line, RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
-        }
-        else
-        {
-            lcd_draw_text(18, 52, "WiFi:  [NOT CONFIGURED] Set on Console", COL_GRAY, COL_CARD, 1);
-        }
-
-        snprintf(line, sizeof(line), "MAC:   %-28s", WiFi.macAddress().c_str());
-        lcd_draw_text(18, 68, line, COL_YELLOW, COL_CARD, 1);
-    }
+    if (wmo == 0U) return "Clear Sky";
+    if (wmo == 1U) return "Mainly Clear";
+    if (wmo == 2U) return "Partly Cloudy";
+    if (wmo == 3U) return "Overcast";
+    if (wmo == 45U || wmo == 48U) return "Foggy";
+    if (wmo >= 51U && wmo <= 57U) return "Drizzle";
+    if (wmo >= 61U && wmo <= 67U) return "Rain";
+    if (wmo >= 71U && wmo <= 77U) return "Snow";
+    if (wmo >= 80U && wmo <= 82U) return "Rain Showers";
+    if (wmo >= 85U && wmo <= 86U) return "Snow Showers";
+    if (wmo >= 95U) return "Thunderstorm";
+    return "Cloudy";
 }
 
 static void draw_static_ui(void)
@@ -353,7 +334,13 @@ static void draw_static_ui(void)
     /* Top Header Bar */
     lcd_fill_rect(0, 0, LCD_W, 24, thm.bar565);
     lcd_fill_rect(0, 24, LCD_W, 2, thm.accent565);
-    lcd_draw_text(8, 5, "STM32 + ESP32-C6 HUD", thm.accent565, thm.bar565, 2);
+
+    static const char * const kScreenTitles[3] = {
+        "1/3 ESP32 NET & LINK",
+        "2/3 STM32 CONSOLE",
+        "3/3 WEATHER & CLOCK"
+    };
+    lcd_draw_text(8, 5, kScreenTitles[s_screen_idx % 3U], thm.accent565, thm.bar565, 2);
 
     /* Info Cards */
     lcd_fill_rect(8, 30, 304, 58, COL_CARD);
@@ -362,19 +349,191 @@ static void draw_static_ui(void)
     lcd_fill_rect(8, 92, 304, 74, COL_CARD);
     lcd_fill_rect(8, 92, 3, 74, s_stm32_online ? COL_GREEN : RGB888_TO_565(0xC6, 0x28, 0x28));
 
-    char line[64];
-    snprintf(line, sizeof(line), "Theme: %-12s (BOOT btn)", thm.name);
-    lcd_draw_text(18, 36, line, COL_WHITE, COL_CARD, 1);
-
-    update_wifi_card_lines();
-
     /* Onboard addressable LED on ESP32-C6-LCD-1.47 uses GRB byte order */
-    neopixelWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
+    rgbLedWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
+}
+
+static void render_screen_esp32_net(void)
+{
+    char line[64];
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        snprintf(line, sizeof(line), "WiFi:  [OK] %-15s (%ddBm)  ", s_wifi_ssid.c_str(), (int)WiFi.RSSI());
+        lcd_draw_text(18, 36, line, COL_GREEN, COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "IPv4:  %-15s Ch:%-2d        ",
+                 WiFi.localIP().toString().c_str(), (int)WiFi.channel());
+        lcd_draw_text(18, 52, line, COL_YELLOW, COL_CARD, 1);
+    }
+    else if (s_wifi_connecting)
+    {
+        snprintf(line, sizeof(line), "WiFi:  [CONNECTING...] %-14s", s_wifi_ssid.c_str());
+        lcd_draw_text(18, 36, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
+        lcd_draw_text(18, 52, "IPv4:  Waiting DHCP...              ", COL_GRAY, COL_CARD, 1);
+    }
+    else
+    {
+        snprintf(line, sizeof(line), "WiFi:  [OFFLINE] %-20s",
+                 s_wifi_ssid.length() > 0 ? s_wifi_ssid.c_str() : "Not configured");
+        lcd_draw_text(18, 36, line, RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
+        lcd_draw_text(18, 52, "IPv4:  0.0.0.0                      ", COL_GRAY, COL_CARD, 1);
+    }
+
+    snprintf(line, sizeof(line), "MAC:   %-17s [BOOT:Page]", WiFi.macAddress().c_str());
+    lcd_draw_text(18, 68, line, COL_WHITE, COL_CARD, 1);
+
+    /* Bottom Card: UART4 Link Activity & ESP32-C6 Memory Breakdown */
+    snprintf(line, sizeof(line), "Link:  %-8s | 115200 8N1 PA0/PA1",
+             s_stm32_online ? "ONLINE" : "WAITING");
+    lcd_draw_text(18, 98, line, s_stm32_online ? COL_GREEN : RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
+
+    snprintf(line, sizeof(line), "UART:  TX:%lu (%luKB) RX:%lu (%luKB)   ",
+             (unsigned long)s_uart_tx_cnt, (unsigned long)(s_uart_tx_bytes / 1024UL),
+             (unsigned long)s_uart_rx_cnt, (unsigned long)(s_uart_rx_bytes / 1024UL));
+    lcd_draw_text(18, 114, line, COL_YELLOW, COL_CARD, 1);
+
+    uint32_t esp_free_kb  = ESP.getFreeHeap() / 1024UL;
+    uint32_t esp_total_kb = ESP.getHeapSize() / 1024UL;
+    uint32_t esp_min_kb   = ESP.getMinFreeHeap() / 1024UL;
+    snprintf(line, sizeof(line), "C6 RAM:%lu/%lu KB Free (Min:%lu KB)   ",
+             (unsigned long)esp_free_kb, (unsigned long)esp_total_kb, (unsigned long)esp_min_kb);
+    lcd_draw_text(18, 130, line, COL_WHITE, COL_CARD, 1);
+
+    uint32_t up_s = millis() / 1000UL;
+    snprintf(line, sizeof(line), "C6 CPU:%lu MHz | Up: %02lu:%02lu:%02lu       ",
+             (unsigned long)ESP.getCpuFreqMHz(),
+             (unsigned long)(up_s / 3600UL), (unsigned long)((up_s / 60UL) % 60UL), (unsigned long)(up_s % 60UL));
+    lcd_draw_text(18, 146, line, COL_GRAY, COL_CARD, 1);
+}
+
+static void render_screen_stm32_console(void)
+{
+    char line[64];
+    const CompanionTheme &thm = kThemes[s_theme_idx];
+
+    if (s_stm32_online)
+    {
+        snprintf(line, sizeof(line), "State: [ONLINE]  App: %-14s", s_stm32_app);
+        lcd_draw_text(18, 36, line, COL_GREEN, COL_CARD, 1);
+
+        char ext_buf[16];
+        if (s_stm32_text > -900)
+        {
+            snprintf(ext_buf, sizeof(ext_buf), "%s%ld.%ld C",
+                     (s_stm32_text < 0) ? "-" : "+",
+                     (long)(abs(s_stm32_text) / 10), (long)(abs(s_stm32_text) % 10));
+        }
+        else
+        {
+            snprintf(ext_buf, sizeof(ext_buf), "N/A");
+        }
+
+        snprintf(line, sizeof(line), "MCU:   %ld.%ld C   | Room DS18B20: %-8s",
+                 (long)(s_stm32_tmcu / 10), (long)(abs(s_stm32_tmcu) % 10), ext_buf);
+        lcd_draw_text(18, 52, line, COL_YELLOW, COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "Theme: %-12s | 168 MHz F407  ", thm.name);
+        lcd_draw_text(18, 68, line, COL_WHITE, COL_CARD, 1);
+    }
+    else
+    {
+        lcd_draw_text(18, 36, "State: [WAITING STM32 LINK...]      ", RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
+        lcd_draw_text(18, 52, "Check P11: PA0->GP19, PA1<-GP18     ", COL_WHITE, COL_CARD, 1);
+        lcd_draw_text(18, 68, "Press BOOT button for next screen   ", COL_GRAY, COL_CARD, 1);
+    }
+
+    /* Bottom Card: STM32 Memory Architecture */
+    snprintf(line, sizeof(line), "RTOS Heap: %3lu / 304 KB (Min:%3lu KB)",
+             (unsigned long)s_stm32_heap,
+             (unsigned long)((s_stm32_min_heap > 0) ? s_stm32_min_heap : s_stm32_heap));
+    lcd_draw_text(18, 98, line, COL_GREEN, COL_CARD, 1);
+
+    lcd_draw_text(18, 114, "Int SRAM:  128 KB (OS:96K App:32K)  ", COL_WHITE, COL_CARD, 1);
+    lcd_draw_text(18, 130, "CCM RAM:   64 KB  (Zero-Wait D-Bus) ", COL_WHITE, COL_CARD, 1);
+    lcd_draw_text(18, 146, "Ext SRAM:  1024 KB FSMC | Flash: 1MB", COL_YELLOW, COL_CARD, 1);
+}
+
+static void render_screen_weather_clock(void)
+{
+    char line[64];
+    time_t now = time(nullptr);
+    struct tm ti;
+    localtime_r(&now, &ti);
+
+    if (ti.tm_year >= (2024 - 1900))
+    {
+        static const char * const kWd[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+        static const char * const kMo[12] = {
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+        };
+        char clk[16];
+        snprintf(clk, sizeof(clk), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+        lcd_draw_text(18, 36, clk, COL_GREEN, COL_CARD, 2);
+
+        snprintf(line, sizeof(line), "%s, %02d %s %04d",
+                 kWd[ti.tm_wday % 7], ti.tm_mday, kMo[ti.tm_mon % 12], ti.tm_year + 1900);
+        lcd_draw_text(132, 36, line, COL_WHITE, COL_CARD, 1);
+        lcd_draw_text(132, 52, "NTP: Synchronized   ", COL_YELLOW, COL_CARD, 1);
+    }
+    else
+    {
+        lcd_draw_text(18, 36, "--:--:--", COL_GRAY, COL_CARD, 2);
+        lcd_draw_text(132, 36, "Waiting NTP Sync... ", COL_GRAY, COL_CARD, 1);
+        lcd_draw_text(132, 52, "Connect Wi-Fi AP    ", COL_WHITE, COL_CARD, 1);
+    }
+
+    char room_buf[36];
+    if (s_stm32_online && s_stm32_text > -900)
+    {
+        snprintf(room_buf, sizeof(room_buf), "In-Room (DS18B20): %s%ld.%ld C      ",
+                 (s_stm32_text < 0) ? "-" : "+",
+                 (long)(abs(s_stm32_text) / 10), (long)(abs(s_stm32_text) % 10));
+    }
+    else
+    {
+        snprintf(room_buf, sizeof(room_buf), "In-Room (DS18B20): N/A          ");
+    }
+    lcd_draw_text(18, 68, room_buf, COL_WHITE, COL_CARD, 1);
+
+    /* Bottom Card: Outdoor Open-Meteo Weather & 3-Day Forecast */
+    if (s_wth_valid)
+    {
+        snprintf(line, sizeof(line), "%-14s | %-18s", s_wth_city, wmo_short_desc(s_wth_wmo));
+        lcd_draw_text(18, 98, line, RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "Outdoor: %s%d.%d C (Feels %s%d.%d C)    ",
+                 (s_wth_t_deci < 0) ? "-" : "+", abs(s_wth_t_deci) / 10, abs(s_wth_t_deci) % 10,
+                 (s_wth_fl_deci < 0) ? "-" : "+", abs(s_wth_fl_deci) / 10, abs(s_wth_fl_deci) % 10);
+        lcd_draw_text(18, 114, line, COL_YELLOW, COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "Humidity: %u%%    | Wind: %u.%u km/h   ",
+                 (unsigned int)s_wth_hum,
+                 (unsigned int)(s_wth_wind_deci / 10U), (unsigned int)(s_wth_wind_deci % 10U));
+        lcd_draw_text(18, 130, line, COL_WHITE, COL_CARD, 1);
+
+        snprintf(line, sizeof(line), "3-Day: T:%s%d/%s%d  Tm:%s%d/%s%d  D3:%s%d/%s%d  ",
+                 (s_wth_hi[0] < 0) ? "-" : "+", abs(s_wth_hi[0]) / 10,
+                 (s_wth_lo[0] < 0) ? "-" : "+", abs(s_wth_lo[0]) / 10,
+                 (s_wth_hi[1] < 0) ? "-" : "+", abs(s_wth_hi[1]) / 10,
+                 (s_wth_lo[1] < 0) ? "-" : "+", abs(s_wth_lo[1]) / 10,
+                 (s_wth_hi[2] < 0) ? "-" : "+", abs(s_wth_hi[2]) / 10,
+                 (s_wth_lo[2] < 0) ? "-" : "+", abs(s_wth_lo[2]) / 10);
+        lcd_draw_text(18, 146, line, COL_GRAY, COL_CARD, 1);
+    }
+    else
+    {
+        lcd_draw_text(18, 98,  "Open-Meteo Weather:                 ", RGB888_TO_565(0x00, 0xE5, 0xFF), COL_CARD, 1);
+        lcd_draw_text(18, 114, (WiFi.status() == WL_CONNECTED)
+                               ? "Fetching outdoor forecast...        "
+                               : "Wi-Fi offline (no internet data)    ", COL_YELLOW, COL_CARD, 1);
+        lcd_draw_text(18, 130, "Connect Wi-Fi in Console Settings   ", COL_GRAY, COL_CARD, 1);
+        lcd_draw_text(18, 146, "Press BOOT button to switch page    ", COL_WHITE, COL_CARD, 1);
+    }
 }
 
 static void update_dynamic_ui(void)
 {
-    char line[64];
     bool was_online = s_stm32_online;
     s_stm32_online = (millis() - s_last_stm32_rx) < 1800U;
 
@@ -382,57 +541,19 @@ static void update_dynamic_ui(void)
     {
         draw_static_ui();
     }
-    else
+
+    switch (s_screen_idx % 3U)
     {
-        update_wifi_card_lines();
-    }
-
-    if (s_stm32_online)
-    {
-        snprintf(line, sizeof(line), "STM32: [ONLINE] App: %-14s", s_stm32_app);
-        lcd_draw_text(18, 98, line, COL_GREEN, COL_CARD, 1);
-
-        char ext_buf[16];
-        if (s_stm32_text > -900)
-        {
-            snprintf(ext_buf, sizeof(ext_buf), "%ld.%ld C", (long)(s_stm32_text / 10), (long)(abs(s_stm32_text) % 10));
-        }
-        else
-        {
-            snprintf(ext_buf, sizeof(ext_buf), "N/A");
-        }
-
-        snprintf(line, sizeof(line), "MCU: %ld.%ld C | DS18B20: %-10s",
-                 (long)(s_stm32_tmcu / 10), (long)(abs(s_stm32_tmcu) % 10), ext_buf);
-        lcd_draw_text(18, 114, line, COL_WHITE, COL_CARD, 1);
-
-        snprintf(line, sizeof(line), "Heap: %lu KB Free | TX:%lu RX:%lu   ",
-                 (unsigned long)s_stm32_heap, (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt);
-        lcd_draw_text(18, 130, line, COL_GRAY, COL_CARD, 1);
-
-        if (s_wth_valid)
-        {
-            snprintf(line, sizeof(line), "Out: %s %s%d.%dC (H:%u%% W:%u.%ukm/h)  ",
-                     s_wth_city,
-                     (s_wth_t_deci < 0) ? "-" : "+",
-                     abs(s_wth_t_deci) / 10, abs(s_wth_t_deci) % 10,
-                     (unsigned int)s_wth_hum,
-                     (unsigned int)(s_wth_wind_deci / 10U), (unsigned int)(s_wth_wind_deci % 10U));
-            lcd_draw_text(18, 146, line, COL_YELLOW, COL_CARD, 1);
-        }
-        else
-        {
-            lcd_draw_text(18, 146, "Link: PA0/PA1 <-> GP18/GP19 [OK]   ", COL_YELLOW, COL_CARD, 1);
-        }
-    }
-    else
-    {
-        lcd_draw_text(18, 98,  "STM32: [WAITING LINK...]          ", RGB888_TO_565(0xFF, 0x8A, 0x80), COL_CARD, 1);
-        lcd_draw_text(18, 114, "Wiring: PA0->GP19 | PA1<-GP18     ", COL_WHITE, COL_CARD, 1);
-        snprintf(line, sizeof(line), "Packets: TX=%lu | RX=%lu bytes   ",
-                 (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt);
-        lcd_draw_text(18, 130, line, COL_GRAY, COL_CARD, 1);
-        lcd_draw_text(18, 146, "Press BOOT btn to test themes     ", COL_YELLOW, COL_CARD, 1);
+        case 0:
+            render_screen_esp32_net();
+            break;
+        case 1:
+            render_screen_stm32_console();
+            break;
+        case 2:
+        default:
+            render_screen_weather_clock();
+            break;
     }
 }
 
@@ -513,11 +634,24 @@ static void fetch_weather_now(void)
                 if (cp != NULL)
                 {
                     cp += 8;
-                    size_t l = strcspn(cp, "\"");
-                    if (l > 0 && l < sizeof(s_wth_city))
+                    size_t out_i = 0;
+                    while (*cp != '\0' && *cp != '"' && out_i + 1 < sizeof(s_wth_city))
                     {
-                        strncpy(s_wth_city, cp, l);
-                        s_wth_city[l] = '\0';
+                        uint8_t c0 = (uint8_t)cp[0];
+                        uint8_t c1 = (uint8_t)cp[1];
+                        if (c0 == 0xC8 && (c1 == 0x9A || c1 == 0x9B)) { s_wth_city[out_i++] = 't'; cp += 2; }
+                        else if (c0 == 0xC8 && (c1 == 0x98 || c1 == 0x99)) { s_wth_city[out_i++] = 's'; cp += 2; }
+                        else if (c0 == 0xC4 && (c1 == 0x82 || c1 == 0x83)) { s_wth_city[out_i++] = 'a'; cp += 2; }
+                        else if (c0 == 0xC3 && (c1 == 0xA2 || c1 == 0x82)) { s_wth_city[out_i++] = 'a'; cp += 2; }
+                        else if (c0 == 0xC3 && (c1 == 0xAE || c1 == 0x8E)) { s_wth_city[out_i++] = 'i'; cp += 2; }
+                        else if (c0 == 0xC5 && (c1 == 0xA2 || c1 == 0xA3)) { s_wth_city[out_i++] = 't'; cp += 2; }
+                        else if (c0 == 0xC5 && (c1 == 0x9E || c1 == 0x9F)) { s_wth_city[out_i++] = 's'; cp += 2; }
+                        else if (c0 >= 0x20 && c0 <= 0x7E) { s_wth_city[out_i++] = (char)c0; cp++; }
+                        else { cp++; }
+                    }
+                    if (out_i > 0)
+                    {
+                        s_wth_city[out_i] = '\0';
                     }
                 }
             }
@@ -609,9 +743,21 @@ static void handle_stm32_packet(const char *pkt)
     if (strncmp(pkt, "STM32:HB", 8) == 0)
     {
         s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
 
         const char *p = strstr(pkt, "HEAP=");
         if (p) s_stm32_heap = (uint32_t)strtoul(p + 5, NULL, 10);
+
+        p = strstr(pkt, "MINH=");
+        if (p) s_stm32_min_heap = (uint32_t)strtoul(p + 5, NULL, 10);
+
+        p = strstr(pkt, "SD=");
+        if (p)
+        {
+            s_stm32_sd_free = (uint32_t)strtoul(p + 3, NULL, 10);
+            const char *sl = strchr(p + 3, '/');
+            if (sl) s_stm32_sd_tot = (uint32_t)strtoul(sl + 1, NULL, 10);
+        }
 
         p = strstr(pkt, "TMCU=");
         if (p) s_stm32_tmcu = (int32_t)strtol(p + 5, NULL, 10);
@@ -701,7 +847,9 @@ static void stm32_uart_send(const char *str)
 {
     if (str != NULL)
     {
-        (void)uart_write_bytes(UART_NUM_1, str, strlen(str));
+        size_t len = strlen(str);
+        (void)uart_write_bytes(UART_NUM_1, str, len);
+        s_uart_tx_bytes += (uint32_t)len;
     }
 }
 
@@ -742,18 +890,12 @@ void loop()
         if (!digitalRead(BOOT_BTN_PIN))
         {
             s_boot_presses++;
-            s_theme_idx = (s_theme_idx + 1U) % 4U;
+            s_screen_idx = (s_screen_idx + 1U) % 3U;
             draw_static_ui();
             update_dynamic_ui();
 
-            /* Notify STM32 of theme change from ESP32 */
-            char cmd[32];
-            snprintf(cmd, sizeof(cmd), "ESP32:SET_THM=%u\n", (unsigned int)s_theme_idx);
-            stm32_uart_send(cmd);
-            s_uart_tx_cnt++;
-
-            Serial.printf("[ESP32-C6] Switched theme to %s (press #%lu)\r\n",
-                          kThemes[s_theme_idx].name, (unsigned long)s_boot_presses);
+            Serial.printf("[ESP32-C6] Switched HUD page to %u/3 (press #%lu)\r\n",
+                          (unsigned int)(s_screen_idx + 1U), (unsigned long)s_boot_presses);
         }
     }
     last_btn = btn;
@@ -763,7 +905,7 @@ void loop()
     for (int i = 0; i < rx_len; i++)
     {
         char c = (char)rx_buf[i];
-        s_uart_rx_cnt++;
+        s_uart_rx_bytes++;
 
         if (c == '\n' || c == '\r')
         {
