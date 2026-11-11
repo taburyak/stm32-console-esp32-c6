@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <time.h>
 #include "driver/uart.h"
@@ -83,6 +84,23 @@ static uint32_t s_stm32_heap     = 0;
 static int32_t  s_stm32_tmcu     = 0;
 static int32_t  s_stm32_text     = -999;
 static char     s_stm32_app[32]  = "connecting...";
+
+/* Weather state (Open-Meteo API) */
+static bool     s_wth_valid      = false;
+static bool     s_wth_req_now    = false;
+static uint32_t s_last_wth_fetch = 0;
+static uint32_t s_last_wth_send  = 0;
+static int16_t  s_wth_t_deci     = 0;
+static int16_t  s_wth_fl_deci    = 0;
+static uint8_t  s_wth_hum        = 0;
+static uint16_t s_wth_wind_deci  = 0;
+static uint8_t  s_wth_wmo        = 0;
+static int16_t  s_wth_hi[3]      = {0, 0, 0};
+static int16_t  s_wth_lo[3]      = {0, 0, 0};
+static uint8_t  s_wth_dwmo[3]    = {0, 0, 0};
+static char     s_wth_city[24]   = "Auto";
+static float    s_wth_lat        = 0.0f;
+static float    s_wth_lon        = 0.0f;
 
 static char     s_rx_line[128];
 static uint16_t s_rx_line_len    = 0;
@@ -392,7 +410,20 @@ static void update_dynamic_ui(void)
                  (unsigned long)s_stm32_heap, (unsigned long)s_uart_tx_cnt, (unsigned long)s_uart_rx_cnt);
         lcd_draw_text(18, 130, line, COL_GRAY, COL_CARD, 1);
 
-        lcd_draw_text(18, 146, "Link: PA0/PA1 <-> GP18/GP19 [OK]   ", COL_YELLOW, COL_CARD, 1);
+        if (s_wth_valid)
+        {
+            snprintf(line, sizeof(line), "Out: %s %s%d.%dC (H:%u%% W:%u.%ukm/h)  ",
+                     s_wth_city,
+                     (s_wth_t_deci < 0) ? "-" : "+",
+                     abs(s_wth_t_deci) / 10, abs(s_wth_t_deci) % 10,
+                     (unsigned int)s_wth_hum,
+                     (unsigned int)(s_wth_wind_deci / 10U), (unsigned int)(s_wth_wind_deci % 10U));
+            lcd_draw_text(18, 146, line, COL_YELLOW, COL_CARD, 1);
+        }
+        else
+        {
+            lcd_draw_text(18, 146, "Link: PA0/PA1 <-> GP18/GP19 [OK]   ", COL_YELLOW, COL_CARD, 1);
+        }
     }
     else
     {
@@ -405,8 +436,176 @@ static void update_dynamic_ui(void)
     }
 }
 
+static void stm32_uart_send(const char *str);
+
+static bool parse_json_float_after(const char *src, const char *key, float *out)
+{
+    if (src == NULL || key == NULL || out == NULL) return false;
+    const char *p = strstr(src, key);
+    if (p == NULL) return false;
+    p += strlen(key);
+    while (*p == ' ' || *p == ':' || *p == '"') p++;
+    *out = strtof(p, NULL);
+    return true;
+}
+
+static bool parse_json_float_array3(const char *src, const char *key, float out[3])
+{
+    if (src == NULL || key == NULL) return false;
+    const char *p = strstr(src, key);
+    if (p == NULL) return false;
+    p = strchr(p, '[');
+    if (p == NULL) return false;
+    p++;
+    for (int i = 0; i < 3; i++)
+    {
+        while (*p == ' ' || *p == ',') p++;
+        char *endp = NULL;
+        out[i] = strtof(p, &endp);
+        if (endp == p) return false;
+        p = endp;
+    }
+    return true;
+}
+
+static void send_weather_to_stm32(void)
+{
+    if (!s_wth_valid) return;
+    char wbuf[128];
+    snprintf(wbuf, sizeof(wbuf),
+             "ESP32:WTH,OK=1,T=%d,FL=%d,HUM=%u,WND=%u,WMO=%u,HI=%d/%d/%d,LO=%d/%d/%d,DW=%u/%u/%u,CITY=%.20s\n",
+             (int)s_wth_t_deci, (int)s_wth_fl_deci,
+             (unsigned int)s_wth_hum, (unsigned int)s_wth_wind_deci, (unsigned int)s_wth_wmo,
+             (int)s_wth_hi[0], (int)s_wth_hi[1], (int)s_wth_hi[2],
+             (int)s_wth_lo[0], (int)s_wth_lo[1], (int)s_wth_lo[2],
+             (unsigned int)s_wth_dwmo[0], (unsigned int)s_wth_dwmo[1], (unsigned int)s_wth_dwmo[2],
+             s_wth_city);
+    stm32_uart_send(wbuf);
+    s_uart_tx_cnt++;
+    s_last_wth_send = millis();
+}
+
+static void fetch_weather_now(void)
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.setTimeout(3500);
+
+    /* 1. Auto-detect city & coordinates via ip-api.com if not resolved yet */
+    if (s_wth_lat == 0.0f && s_wth_lon == 0.0f)
+    {
+        if (http.begin("http://ip-api.com/json/?fields=status,city,lat,lon"))
+        {
+            int code = http.GET();
+            if (code == 200)
+            {
+                String geo = http.getString();
+                const char *g = geo.c_str();
+                float lat = 0.0f, lon = 0.0f;
+                if (parse_json_float_after(g, "\"lat\"", &lat) &&
+                    parse_json_float_after(g, "\"lon\"", &lon))
+                {
+                    s_wth_lat = lat;
+                    s_wth_lon = lon;
+                }
+                const char *cp = strstr(g, "\"city\":\"");
+                if (cp != NULL)
+                {
+                    cp += 8;
+                    size_t l = strcspn(cp, "\"");
+                    if (l > 0 && l < sizeof(s_wth_city))
+                    {
+                        strncpy(s_wth_city, cp, l);
+                        s_wth_city[l] = '\0';
+                    }
+                }
+            }
+            http.end();
+        }
+        /* Fallback to Kyiv if geolocation service is unreachable */
+        if (s_wth_lat == 0.0f && s_wth_lon == 0.0f)
+        {
+            s_wth_lat = 50.45f;
+            s_wth_lon = 30.52f;
+            strncpy(s_wth_city, "Kyiv", sizeof(s_wth_city) - 1);
+        }
+    }
+
+    /* 2. Query Open-Meteo current weather + 3-day forecast */
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
+             "&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=3",
+             s_wth_lat, s_wth_lon);
+
+    if (http.begin(url))
+    {
+        int code = http.GET();
+        if (code == 200)
+        {
+            String body = http.getString();
+            const char *b = body.c_str();
+            const char *cur_sec = strstr(b, "\"current\":{");
+            const char *day_sec = strstr(b, "\"daily\":{");
+
+            if (cur_sec != NULL)
+            {
+                float t = 0.0f, fl = 0.0f, hum = 0.0f, wmo = 0.0f, wnd = 0.0f;
+                (void)parse_json_float_after(cur_sec, "\"temperature_2m\"", &t);
+                (void)parse_json_float_after(cur_sec, "\"apparent_temperature\"", &fl);
+                (void)parse_json_float_after(cur_sec, "\"relative_humidity_2m\"", &hum);
+                (void)parse_json_float_after(cur_sec, "\"weather_code\"", &wmo);
+                (void)parse_json_float_after(cur_sec, "\"wind_speed_10m\"", &wnd);
+
+                s_wth_t_deci    = (int16_t)lroundf(t * 10.0f);
+                s_wth_fl_deci   = (int16_t)lroundf(fl * 10.0f);
+                s_wth_hum       = (uint8_t)constrain((int)lroundf(hum), 0, 100);
+                s_wth_wmo       = (uint8_t)constrain((int)lroundf(wmo), 0, 99);
+                s_wth_wind_deci = (uint16_t)constrain((int)lroundf(wnd * 10.0f), 0, 9999);
+                s_wth_valid     = true;
+            }
+
+            if (day_sec != NULL)
+            {
+                float d_wmo[3] = {0}, d_hi[3] = {0}, d_lo[3] = {0};
+                if (parse_json_float_array3(day_sec, "\"weather_code\"", d_wmo))
+                {
+                    for (int i = 0; i < 3; i++) s_wth_dwmo[i] = (uint8_t)constrain((int)lroundf(d_wmo[i]), 0, 99);
+                }
+                if (parse_json_float_array3(day_sec, "\"temperature_2m_max\"", d_hi))
+                {
+                    for (int i = 0; i < 3; i++) s_wth_hi[i] = (int16_t)lroundf(d_hi[i] * 10.0f);
+                }
+                if (parse_json_float_array3(day_sec, "\"temperature_2m_min\"", d_lo))
+                {
+                    for (int i = 0; i < 3; i++) s_wth_lo[i] = (int16_t)lroundf(d_lo[i] * 10.0f);
+                }
+            }
+
+            if (s_wth_valid)
+            {
+                s_last_wth_fetch = millis();
+                Serial.printf("[WTH] %s: %d.%d C (WMO=%u, HUM=%u%%, WND=%u.%u km/h)\r\n",
+                              s_wth_city, s_wth_t_deci / 10, abs(s_wth_t_deci) % 10,
+                              (unsigned)s_wth_wmo, (unsigned)s_wth_hum,
+                              (unsigned)(s_wth_wind_deci / 10U), (unsigned)(s_wth_wind_deci % 10U));
+                send_weather_to_stm32();
+                update_dynamic_ui();
+            }
+        }
+        http.end();
+    }
+}
+
 static void handle_stm32_packet(const char *pkt)
 {
+    if (strncmp(pkt, "STM32:REQ_WTH", 13) == 0)
+    {
+        s_wth_req_now = true;
+        return;
+    }
     if (strncmp(pkt, "STM32:HB", 8) == 0)
     {
         s_last_stm32_rx = millis();
@@ -625,6 +824,25 @@ void loop()
                     update_dynamic_ui();
                 }
             }
+        }
+    }
+
+    /* Weather Synchronization (fetch on connect/request or every 15 min; push to STM32 every 10 s) */
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        if (s_wth_req_now || !s_wth_valid || (millis() - s_last_wth_fetch >= 900000UL))
+        {
+            static uint32_t last_wth_attempt = 0;
+            if (s_wth_req_now || (millis() - last_wth_attempt >= 15000UL))
+            {
+                s_wth_req_now    = false;
+                last_wth_attempt = millis();
+                fetch_weather_now();
+            }
+        }
+        else if (s_wth_valid && (millis() - s_last_wth_send >= 10000UL))
+        {
+            send_weather_to_stm32();
         }
     }
 
