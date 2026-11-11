@@ -107,7 +107,7 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
     <div class="file-list" id="fileList"></div>
   </section>
 
-  <!-- Right Pane: Universal Editor & Live C-Script IDE -->
+  <!-- Right Pane: Universal Editor, Image Viewer & Live C-Script IDE -->
   <section class="pane">
     <div class="pane-hdr">
       <div>
@@ -121,7 +121,7 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
         <button id="btnDemo" onclick="loadTemplate()">✨ Demo .c</button>
         <button id="btnSave" class="btn-accent" onclick="saveCurrentFile(false)">💾 Save (Ctrl+S)</button>
         <button class="btn-green" id="btnSaveRun" onclick="saveCurrentFile(true)">▶ Save & Run on Console</button>
-        <button class="btn-red" onclick="stopApp()">⏹ Stop App</button>
+        <button class="btn-red" id="btnStopApp" onclick="stopApp()">⏹ Stop App</button>
       </div>
     </div>
     <div class="editor-wrap" id="editorWrap">
@@ -158,6 +158,7 @@ let curDir = '/';
 let curFile = '';
 let isDirty = false;
 let themeLockUntil = 0;
+let natW = 0, natH = 0;
 const EDIT_EXTS = ['.c','.h','.txt','.md','.ini','.cfg','.log','.json','.csv'];
 const IMG_EXTS  = ['.bmp','.png','.jpg','.jpeg','.gif','.sjpg'];
 
@@ -166,17 +167,36 @@ function setStatus(msg, color){
   el.textContent = msg;
   el.style.color = color || 'var(--muted)';
 }
+
 function setProgress(pct){
   document.getElementById('progBar').style.width = Math.max(0, Math.min(100, pct)) + '%';
 }
+
 function isEditable(name){
   const lower = name.toLowerCase();
   return EDIT_EXTS.some(ext => lower.endsWith(ext));
 }
+
 function isImage(name){
   const lower = name.toLowerCase();
   return IMG_EXTS.some(ext => lower.endsWith(ext));
 }
+
+function isRunnable(name){
+  const lower = name.toLowerCase();
+  return lower.endsWith('.c') || lower.endsWith('.bin');
+}
+
+function joinPath(dir, name){
+  if(!dir || dir === '/') return '/' + name.replace(/^\/+/, '');
+  return dir.replace(/\/+$/, '') + '/' + name.replace(/^\/+/, '');
+}
+
+function formatBytes(sz){
+  if(sz < 1024) return sz + ' B';
+  return (sz / 1024).toFixed(1) + ' KB';
+}
+
 function showPaneMode(mode){
   const isImg = (mode === 'image');
   document.getElementById('editorWrap').style.display = isImg ? 'none' : 'flex';
@@ -187,18 +207,6 @@ function showPaneMode(mode){
   document.getElementById('btnDemo').style.display    = isImg ? 'none' : 'inline-flex';
   document.getElementById('btnSave').style.display    = isImg ? 'none' : 'inline-flex';
   document.getElementById('btnSaveRun').style.display = isImg ? 'none' : 'inline-flex';
-}
-function isRunnable(name){
-  const lower = name.toLowerCase();
-  return lower.endsWith('.c') || lower.endsWith('.bin');
-}
-function joinPath(dir, name){
-  if(!dir || dir === '/') return '/' + name.replace(/^\/+/, '');
-  return dir.replace(/\/+$/, '') + '/' + name.replace(/^\/+/, '');
-}
-function formatBytes(sz){
-  if(sz < 1024) return sz + ' B';
-  return (sz / 1024).toFixed(1) + ' KB';
 }
 
 async function pollStatus(){
@@ -236,11 +244,9 @@ async function loadDir(path){
   try{
     const r = await fetch('/api/fs/list?path=' + encodeURIComponent(curDir));
     const d = await r.json();
-    coconst icon = item.dir ? '📁 ' : (isImage(item.name) ? '🖼 ' : (isEditable(item.name) ? '📄 ' : '📦 '));
-      nameEl.innerHTML = icon + item.name;
-      nameEl.onclick = () => {
-        if(item.dir) loadDir(full);
-        else if(isImage(item.name)) openImageInViewer(full, item.size
+    const box = document.getElementById('fileList');
+    box.innerHTML = '';
+    if(!d.ok){
       box.innerHTML = '<div style="padding:14px;color:var(--red)">SD directory read error or STM32 busy.</div>';
       setStatus('Failed to list directory.', 'var(--red)');
       return;
@@ -254,9 +260,11 @@ async function loadDir(path){
 
       const nameEl = document.createElement('div');
       nameEl.className = 'f-name ' + (item.dir ? 'f-dir' : '');
-      nameEl.innerHTML = (item.dir ? '📁 ' : (isEditable(item.name) ? '📄 ' : '📦 ')) + item.name;
+      const icon = item.dir ? '📁 ' : (isImage(item.name) ? '🖼 ' : (isEditable(item.name) ? '📄 ' : '📦 '));
+      nameEl.innerHTML = icon + item.name;
       nameEl.onclick = () => {
         if(item.dir) loadDir(full);
+        else if(isImage(item.name)) openImageInViewer(full, item.size);
         else if(isEditable(item.name)) openFileInEditor(full);
         else downloadFile(full);
       };
@@ -313,7 +321,9 @@ function goUp(){
   loadDir(idx <= 0 ? '/' : curDir.substring(0, idx));
 }
 
-asyhowPaneMode('editor');
+async function openFileInEditor(path){
+  if(isDirty && !confirm('Discard unsaved changes in ' + curFile + '?')) return;
+  showPaneMode('editor');
   setStatus('Reading ' + path + ' from STM32 SD...');
   setProgress(35);
   try{
@@ -340,7 +350,6 @@ asyhowPaneMode('editor');
   }
 }
 
-let natW = 0, natH = 0;
 function setImgZoom(scale){
   const img = document.getElementById('previewImg');
   if(!natW || !natH) return;
@@ -394,9 +403,7 @@ async function setAsWallpaper(){
   setStatus('Applying ' + curFile + ' as Console desktop wallpaper...', 'var(--amber)');
   const r = await fetch('/api/wallpaper?path=' + encodeURIComponent(curFile), {method:'POST'});
   if(r.ok) setStatus('Wallpaper updated on Console: ' + curFile, 'var(--green)');
-  else setStatus('Failed to set wallpaper', 'var(--red)'); setProgress(0);
-    setStatus('Error reading file', 'var(--red)');
-  }
+  else setStatus('Failed to set wallpaper', 'var(--red)');
 }
 
 function toHexString(u8){
