@@ -56,6 +56,11 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
 .prog-wrap{height:4px;background:#090d14;width:100%;overflow:hidden}
 .prog-bar{height:100%;width:0%;background:var(--green);transition:width 0.15s}
 .help-box{background:#0e1522;border-top:1px solid var(--border);padding:10px 14px;font-size:0.78rem;line-height:1.45;color:#b8c7dc;display:none;max-height:190px;overflow-y:auto;font-family:Consolas,monospace}
+.pad-box{background:#0d1421;border-top:1px solid var(--border);padding:12px 16px;display:none;align-items:center;justify-content:space-around;gap:16px;flex-wrap:wrap;user-select:none}
+.dpad{display:grid;grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,40px);gap:4px}
+.act-pad{display:grid;grid-template-columns:repeat(2,64px);gap:8px}
+.pad-btn{justify-content:center;font-weight:700;font-size:0.86rem;border-radius:8px;padding:8px;touch-action:none}
+.pad-btn.held{background:var(--accent)!important;color:#000!important;border-color:#fff!important;transform:scale(0.96)}
 </style>
 </head>
 <body>
@@ -70,6 +75,8 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
     <div class="tele-item">MCU: <b id="tMcu">--</b></div>
     <div class="tele-item">Outdoor: <b id="tOut">--</b></div>
     <div class="tele-item">STM32 Heap: <b id="tHeap">--</b></div>
+    <button class="btn-amber" onclick="captureScreen()" title="Capture live 320x240 display to SD:/screenshots and preview">📸 Capture Screen</button>
+    <button id="btnPadToggle" onclick="toggleGamepad()" title="Toggle Virtual Web Gamepad">🎮 Gamepad</button>
     <div class="tele-item">Theme:
       <select id="thmSel" onchange="setTheme(this.value)">
         <option value="0">Cyber Blue</option>
@@ -141,10 +148,38 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
     </div>
     <div id="helpBox" class="help-box">
       <b style="color:var(--accent)">C-Script Built-in Functions:</b><br>
-      • <b>Graphics:</b> clear_screen(rgb565); fill_rect(x,y,w,h,col); draw_pixel(x,y,col); draw_line(x0,y0,x1,y1,col); draw_rect(x,y,w,h,col); draw_circle(x,y,r,col); fill_circle(x,y,r,col); draw_text(x,y,"str",fg,bg,scale); draw_num(x,y,val,fg,bg,scale,digits); rgb(r,g,b);<br>
+      • <b>Graphics:</b> clear_screen(rgb565); fill_rect(x,y,w,h,col); draw_pixel(x,y,col); draw_text(x,y,"str",fg,bg,scale); draw_num(x,y,val,fg,bg,scale,digits); RGB565(r,g,b);<br>
       • <b>Input:</b> k = input_poll(); input_pressed(KEY_A | KEY_B | KEY_X | KEY_START | KEY_EXIT | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN); pad_lx(); pad_ly(); pad_rx(); pad_ry();<br>
-      • <b>System & Audio:</b> frame_sync(16); delay_ms(ms); tick_ms(); beep(ms); tone(freq_hz, ms); rand_range(min, max); clamp(val, lo, hi); abs(v); min(a,b); max(a,b);<br>
-      • <b>Persistence:</b> save_int("file.dat", val); val = load_int("file.dat", default_val); exit_app();
+      • <b>Dual-Screen ESP32 HUD & Sensors:</b> esp_online(); esp_hud_clear(); esp_hud_text(line0_5, "str"); esp_hud_num(line0_5, "SCORE: ", val); esp_led(r,g,b); esp_hud_restore(); temp_mcu(); temp_ext(); weather_temp();<br>
+      • <b>System & Storage:</b> frame_sync(16); sleep_ms(ms); get_tick(); beep(ms); play_tone(freq_hz, ms); rand_range(min, max); clamp(val, lo, hi); save_int("best.dat", val); load_int("best.dat", def); exit();
+    </div>
+    <div id="padBox" class="pad-box">
+      <div class="dpad">
+        <div></div>
+        <button class="pad-btn" data-bit="16">▲</button>
+        <div></div>
+        <button class="pad-btn" data-bit="1">◀</button>
+        <div style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem">D-PAD</div>
+        <button class="pad-btn" data-bit="2">▶</button>
+        <div></div>
+        <button class="pad-btn" data-bit="32">▼</button>
+        <div></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;align-items:center">
+        <div style="display:flex;gap:8px">
+          <button class="pad-btn btn-amber" data-bit="256" style="padding:6px 14px">⏯ START</button>
+          <button class="pad-btn btn-red" data-bit="8" style="padding:6px 14px">⎋ EXIT / ESC</button>
+        </div>
+        <label style="font-size:0.76rem;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="chkKbPad" checked> PC Keyboard (Arrows / WASD, Space=A, Z=B, C=X, Enter/Esc)
+        </label>
+      </div>
+      <div class="act-pad">
+        <button class="pad-btn" data-bit="128" style="border-color:var(--accent)">X</button>
+        <button class="pad-btn btn-green" data-bit="4">A (OK)</button>
+        <button class="pad-btn btn-amber" data-bit="64">B</button>
+        <button class="pad-btn" onclick="captureScreen()">📸 Shot</button>
+      </div>
     </div>
     <div class="status-bar">
       <span id="statusMsg">Ready. Connected to ESP32-C6 Web Studio.</span>
@@ -583,26 +618,175 @@ function toggleHelp(){
   b.style.display = (b.style.display === 'block') ? 'none' : 'block';
 }
 
+async function captureScreen(){
+  setStatus('Capturing live 320×240 Console display to SD...', 'var(--amber)');
+  setProgress(45);
+  busyCount++;
+  try{
+    const r = await fetch('/api/screenshot', {method:'POST'});
+    const d = await r.json();
+    if(!r.ok || !d.ok || !d.path){
+      setProgress(0);
+      setStatus('Screen capture failed (check SD card).', 'var(--red)');
+      return;
+    }
+    imgRev[d.path] = Date.now();
+    if(curDir === '/screenshots') await loadDir('/screenshots');
+    openImageInViewer(d.path, 153654);
+    setStatus('Captured live screen -> ' + d.path, 'var(--green)');
+  }catch(e){
+    setProgress(0);
+    setStatus('Screen capture request failed.', 'var(--red)');
+  }finally{
+    busyCount = Math.max(0, busyCount - 1);
+  }
+}
+
+let padOpen = false;
+let padMask = 0;
+let padTimer = null;
+
+function sendPadNow(){
+  fetch('/api/input?mask=' + padMask + '&lx=0&ly=0', {method:'POST'}).catch(() => {});
+}
+
+function setPadBit(bit, down){
+  const next = down ? (padMask | bit) : (padMask & ~bit);
+  if(next === padMask) return;
+  padMask = next;
+  document.querySelectorAll('.pad-btn[data-bit]').forEach(b => {
+    const bb = parseInt(b.dataset.bit, 10);
+    b.classList.toggle('held', (padMask & bb) !== 0);
+  });
+  sendPadNow();
+  if(padMask !== 0 && !padTimer){
+    padTimer = setInterval(() => {
+      if(padMask === 0){ clearInterval(padTimer); padTimer = null; return; }
+      sendPadNow();
+    }, 280);
+  }
+}
+
+function toggleGamepad(){
+  padOpen = !padOpen;
+  document.getElementById('padBox').style.display = padOpen ? 'flex' : 'none';
+  document.getElementById('btnPadToggle').classList.toggle('btn-accent', padOpen);
+  if(!padOpen && padMask !== 0){
+    padMask = 0;
+    sendPadNow();
+  }
+}
+
+document.querySelectorAll('.pad-btn[data-bit]').forEach(btn => {
+  const bit = parseInt(btn.dataset.bit, 10);
+  const press = (e) => { e.preventDefault(); setPadBit(bit, true); };
+  const rel   = (e) => { e.preventDefault(); setPadBit(bit, false); };
+  btn.addEventListener('pointerdown', press);
+  btn.addEventListener('pointerup', rel);
+  btn.addEventListener('pointerleave', rel);
+  btn.addEventListener('pointercancel', rel);
+});
+
+const KB_MAP = {
+  'ArrowLeft': 1, 'KeyA': 1,
+  'ArrowRight': 2, 'KeyD': 2,
+  'ArrowUp': 16, 'KeyW': 16,
+  'ArrowDown': 32, 'KeyS': 32,
+  'Space': 4, 'Enter': 4,
+  'KeyZ': 64, 'KeyX': 64,
+  'KeyC': 128,
+  'KeyP': 256,
+  'Escape': 8
+};
+
+window.addEventListener('keydown', (e) => {
+  if(!padOpen || !document.getElementById('chkKbPad').checked) return;
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if(tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') return;
+  const bit = KB_MAP[e.code];
+  if(bit){
+    e.preventDefault();
+    if(!e.repeat) setPadBit(bit, true);
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  if(!padOpen) return;
+  const bit = KB_MAP[e.code];
+  if(bit){
+    e.preventDefault();
+    setPadBit(bit, false);
+  }
+});
+
 function loadTemplate(){
-  if(isDirty && !confirm('Replace editor content with C-Script template?')) return;
+  if(isDirty && !confirm('Replace editor content with Dual-Screen C-Script template?')) return;
   showPaneMode('editor');
-  if(!curFile || !curFile.endsWith('.c')) curFile = joinPath(curDir === '/' ? '/games' : curDir, 'web_demo.c');
+  if(!curFile || !curFile.endsWith('.c')) curFile = joinPath(curDir === '/' ? '/games' : curDir, 'dual_hud_demo.c');
   document.getElementById('edFileTitle').textContent = '📝 ' + curFile;
   document.getElementById('codeArea').value =
-`// Web Studio Live C-Script Demo
+`// Dual-Screen Companion HUD + Live Bounce Demo
 void main() {
-    int x = 160, y = 120, vx = 3, vy = 2;
+    int px = 132, old_px = 132;
+    int bx = 160, by = 90, vx = 3, vy = 2;
+    int score = 0, best = load_int("best.dat", 0);
+
     clear_screen(COLOR_DARK_BG);
+    fill_rect(0, 0, 320, 20, COLOR_PANEL_BG);
+    draw_text(8, 6, "DUAL-SCREEN PONG   [ESC: EXIT]", COLOR_CYAN, COLOR_PANEL_BG, 1);
+
+    esp_hud_clear();
+    esp_hud_text(0, "=== DUAL-SCREEN TELEMETRY ===");
+    esp_hud_num(1, "SCORE:     ", score);
+    esp_hud_num(2, "HIGH BEST: ", best);
+    esp_hud_num(4, "ROOM TEMP: ", temp_ext());
+    esp_hud_text(5, "LED = GREEN (READY)");
+    esp_led(0, 48, 16);
+
+    fill_rect(px, 222, 56, 6, COLOR_CYAN);
     while (1) {
         int k = input_poll();
         if (input_pressed(KEY_EXIT)) break;
-        fill_circle(x, y, 10, COLOR_DARK_BG);
-        x += vx + pad_lx() / 32;
-        y += vy + pad_ly() / 32;
-        if (x < 14 || x > 305) { vx = -vx; x = clamp(x, 14, 305); beep(15); }
-        if (y < 28 || y > 225) { vy = -vy; y = clamp(y, 28, 225); beep(15); }
-        draw_text(24, 6, "WEB STUDIO LIVE C-SCRIPT  [ESC: EXIT]", COLOR_CYAN, COLOR_DARK_BG, 1);
-        fill_circle(x, y, 10, COLOR_NEON_GREEN);
+
+        old_px = px;
+        if (k & KEY_LEFT)  px -= 5;
+        if (k & KEY_RIGHT) px += 5;
+        px = clamp(px + pad_lx() / 24, 4, 260);
+        if (px != old_px) {
+            fill_rect(old_px, 222, 56, 6, COLOR_DARK_BG);
+            fill_rect(px, 222, 56, 6, COLOR_CYAN);
+        }
+
+        fill_rect(bx - 4, by - 4, 9, 9, COLOR_DARK_BG);
+        bx += vx;
+        by += vy;
+        if (bx <= 8 || bx >= 311) { vx = -vx; bx = clamp(bx, 8, 311); beep(12); }
+        if (by <= 26)             { vy = -vy; by = 26; beep(12); }
+
+        if (vy > 0 && by >= 216 && by <= 224 && bx >= px - 4 && bx <= px + 60) {
+            by = 216;
+            vy = -vy;
+            score++;
+            beep(25);
+            esp_led(0, 60, 20);
+            if (score > best) {
+                best = score;
+                save_int("best.dat", best);
+                esp_led(0, 45, 65);
+            }
+            esp_hud_num(1, "SCORE:     ", score);
+            esp_hud_num(2, "HIGH BEST: ", best);
+        } else if (by > 234) {
+            beep(120);
+            score = 0;
+            bx = 160; by = 80; vy = 2;
+            esp_led(64, 0, 0);
+            esp_hud_num(1, "SCORE:     ", score);
+            esp_hud_text(5, "MISSED! RESETTING...");
+        }
+
+        fill_rect(bx - 4, by - 4, 9, 9, COLOR_AMBER);
+        draw_num(276, 6, score, COLOR_NEON_GREEN, COLOR_PANEL_BG, 1, 3);
         frame_sync(16);
     }
 }

@@ -130,6 +130,20 @@ static bool      s_rpc_strm_done  = false;
 static bool      s_rpc_strm_ok    = false;
 static uint32_t  s_rpc_strm_total = 0;
 
+static bool      s_rpc_shot_done  = false;
+static bool      s_rpc_shot_ok    = false;
+static String    s_rpc_shot_path  = "";
+
+/* SpeedTest & Dual-Screen Game HUD state */
+static bool      s_spd_req_now    = false;
+static uint16_t  s_spd_ping_ms    = 0;
+static uint16_t  s_spd_dl_kbps    = 0;
+static uint16_t  s_spd_link_x10   = 0;
+
+static bool      s_game_hud_mode  = false;
+static bool      s_game_led_ovr   = false;
+static char      s_game_lines[6][52] = {{0}};
+
 static bool      s_rpc_rd_done   = false;
 static bool      s_rpc_rd_ok     = false;
 static uint32_t  s_rpc_rd_total  = 0;
@@ -350,6 +364,30 @@ static const char *wmo_short_desc(uint8_t wmo)
     return "Cloudy";
 }
 
+static void render_game_hud_screen(void)
+{
+    const CompanionTheme &thm = kThemes[s_theme_idx];
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "GAME HUD: %-20s", s_stm32_app);
+    lcd_draw_text(8, 5, hdr, thm.accent565, thm.bar565, 2);
+
+    static const uint16_t kLineColors[6] = {
+        RGB888_TO_565(0x00, 0xE5, 0xFF),
+        COL_YELLOW,
+        COL_GREEN,
+        COL_WHITE,
+        COL_WHITE,
+        COL_GRAY
+    };
+
+    for (uint8_t i = 0; i < 6U; i++)
+    {
+        char padded[52];
+        snprintf(padded, sizeof(padded), "%-48.48s", s_game_lines[i]);
+        lcd_draw_text(16, (int16_t)(34 + i * 21), padded, kLineColors[i], COL_CARD, 1);
+    }
+}
+
 static void draw_static_ui(void)
 {
     const CompanionTheme &thm = kThemes[s_theme_idx];
@@ -359,6 +397,18 @@ static void draw_static_ui(void)
     /* Top Header Bar */
     lcd_fill_rect(0, 0, LCD_W, 24, thm.bar565);
     lcd_fill_rect(0, 24, LCD_W, 2, thm.accent565);
+
+    if (s_game_hud_mode)
+    {
+        lcd_fill_rect(8, 30, 304, 136, COL_CARD);
+        lcd_fill_rect(8, 30, 3, 136, thm.accent565);
+        render_game_hud_screen();
+        if (!s_game_led_ovr)
+        {
+            rgbLedWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
+        }
+        return;
+    }
 
     static const char * const kScreenTitles[3] = {
         "1/3 ESP32 NET & LINK",
@@ -375,7 +425,10 @@ static void draw_static_ui(void)
     lcd_fill_rect(8, 92, 3, 74, s_stm32_online ? COL_GREEN : RGB888_TO_565(0xC6, 0x28, 0x28));
 
     /* Onboard addressable LED on ESP32-C6-LCD-1.47 uses GRB byte order */
-    rgbLedWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
+    if (!s_game_led_ovr)
+    {
+        rgbLedWrite(RGB_LED_PIN, thm.led_g, thm.led_r, thm.led_b);
+    }
 }
 
 static void render_screen_esp32_net(void)
@@ -564,6 +617,12 @@ static void update_dynamic_ui(void)
 {
     bool was_online = s_stm32_online;
     s_stm32_online = (millis() - s_last_stm32_rx) < 5000U;
+
+    if (s_game_hud_mode)
+    {
+        render_game_hud_screen();
+        return;
+    }
 
     if (was_online != s_stm32_online)
     {
@@ -885,10 +944,95 @@ static void handle_stm32_packet(const char *pkt)
         s_rpc_strm_done  = true;
         return;
     }
+    if ((p_cmd = strstr(pkt, "SHOT_OK,")) != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_rpc_shot_path = String(p_cmd + 8);
+        s_rpc_shot_path.trim();
+        s_rpc_shot_ok   = true;
+        s_rpc_shot_done = true;
+        return;
+    }
+    if (strstr(pkt, "SHOT_ERR") != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_rpc_shot_ok   = false;
+        s_rpc_shot_done = true;
+        return;
+    }
+
+    /* Dual-Screen Game HUD & RGB LED commands from STM32 Sandbox Apps */
+    if (strstr(pkt, "GHUD_CLR") != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        memset(s_game_lines, 0, sizeof(s_game_lines));
+        s_game_hud_mode = true;
+        draw_static_ui();
+        return;
+    }
+    if ((p_cmd = strstr(pkt, "GHUD_LN,")) != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        const char *p = p_cmd + 8;
+        int ln = atoi(p);
+        const char *comma = strchr(p, ',');
+        if (ln >= 0 && ln < 6 && comma != NULL)
+        {
+            strncpy(s_game_lines[ln], comma + 1, sizeof(s_game_lines[ln]) - 1);
+            s_game_lines[ln][sizeof(s_game_lines[ln]) - 1] = '\0';
+            if (!s_game_hud_mode)
+            {
+                s_game_hud_mode = true;
+                draw_static_ui();
+            }
+            else
+            {
+                render_game_hud_screen();
+            }
+        }
+        return;
+    }
+    if ((p_cmd = strstr(pkt, "GLED,")) != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        int r = 0, g = 0, b = 0;
+        if (sscanf(p_cmd + 5, "%d,%d,%d", &r, &g, &b) == 3)
+        {
+            s_game_led_ovr = true;
+            rgbLedWrite(RGB_LED_PIN,
+                        (uint8_t)constrain(g, 0, 255),
+                        (uint8_t)constrain(r, 0, 255),
+                        (uint8_t)constrain(b, 0, 255));
+        }
+        return;
+    }
+    if (strstr(pkt, "GHUD_EXIT") != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        if (s_game_hud_mode || s_game_led_ovr)
+        {
+            s_game_hud_mode = false;
+            s_game_led_ovr  = false;
+            draw_static_ui();
+            update_dynamic_ui();
+        }
+        return;
+    }
 
     if (strstr(pkt, "REQ_WTH") != NULL)
     {
         s_wth_req_now = true;
+        return;
+    }
+    if (strstr(pkt, "REQ_SPD") != NULL)
+    {
+        s_spd_req_now = true;
         return;
     }
     if (strstr(pkt, "STM32:HB") != NULL || strstr(pkt, ":HB,") != NULL)
@@ -936,6 +1080,13 @@ static void handle_stm32_packet(const char *pkt)
             if (eol) *eol = '\0';
             eol = strchr(s_stm32_app, '\n');
             if (eol) *eol = '\0';
+
+            if (strcmp(s_stm32_app, "menu") == 0 && (s_game_hud_mode || s_game_led_ovr))
+            {
+                s_game_hud_mode = false;
+                s_game_led_ovr  = false;
+                draw_static_ui();
+            }
         }
 
         update_dynamic_ui();
@@ -1053,6 +1204,166 @@ static bool rpc_wait_ack(uint32_t timeout_ms)
         delay(1);
     }
     return s_rpc_ack_done && s_rpc_ack_ok;
+}
+
+static void run_speedtest_now(void)
+{
+    char msg[96];
+    s_spd_ping_ms  = 0;
+    s_spd_dl_kbps  = 0;
+    s_spd_link_x10 = 0;
+
+    stm32_uart_send("ESP32:SPD,ST=1,PING=0,DL=0,LINK=0\n");
+    s_uart_tx_cnt++;
+
+    /* Stage 1 & 2: Internet HTTP Latency + Download Speed (only if Wi-Fi AP connected) */
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        HTTPClient http;
+        http.setTimeout(3500);
+
+        /* Stage 1: Low-latency HTTP RTT ping against Cloudflare OTP edge */
+        uint32_t p0 = millis();
+        if (http.begin("http://speed.cloudflare.com/__down?bytes=0"))
+        {
+            int code = http.GET();
+            if (code > 0)
+            {
+                uint32_t dt = millis() - p0;
+                s_spd_ping_ms = (uint16_t)((dt > 0U) ? dt : 1U);
+            }
+            http.end();
+        }
+        if (s_spd_ping_ms == 0U && http.begin("http://connectivitycheck.gstatic.com/generate_204"))
+        {
+            p0 = millis();
+            if (http.GET() > 0)
+            {
+                uint32_t dt = millis() - p0;
+                s_spd_ping_ms = (uint16_t)((dt > 0U) ? dt : 1U);
+            }
+            http.end();
+        }
+
+        snprintf(msg, sizeof(msg), "ESP32:SPD,ST=1,PING=%u,DL=0,LINK=0\n", (unsigned int)s_spd_ping_ms);
+        stm32_uart_send(msg);
+        s_uart_tx_cnt++;
+
+        /* Stage 2: 1 MB HTTP stream download benchmark from Cloudflare CDN */
+        const char * const dl_urls[2] = {
+            "http://speed.cloudflare.com/__down?bytes=1048576",
+            "http://ipv4.download.thinkbroadband.com/5MB.zip"
+        };
+        for (int u = 0; u < 2 && s_spd_dl_kbps == 0U; u++)
+        {
+            if (http.begin(dl_urls[u]))
+            {
+                int code = http.GET();
+                if (code == 200)
+                {
+                    WiFiClient *stream = http.getStreamPtr();
+                    static uint8_t dl_buf[4096];
+                    uint32_t got_bytes = 0U;
+                    uint32_t target_bytes = 1048576UL;
+                    uint32_t t_dl0 = millis();
+                    while ((http.connected() || stream->available() > 0) &&
+                           got_bytes < target_bytes &&
+                           (millis() - t_dl0) < 4000U)
+                    {
+                        size_t avail = stream->available();
+                        if (avail > 0)
+                        {
+                            int r = stream->read(dl_buf, (avail > sizeof(dl_buf)) ? sizeof(dl_buf) : avail);
+                            if (r > 0) got_bytes += (uint32_t)r;
+                        }
+                        else
+                        {
+                            delay(1);
+                        }
+                    }
+                    uint32_t elapsed_ms = millis() - t_dl0;
+                    poll_stm32_uart();
+                    if (got_bytes >= 32768UL && elapsed_ms > 0U)
+                    {
+                        uint64_t kbps = ((uint64_t)got_bytes * 8ULL) / (uint64_t)elapsed_ms;
+                        if (kbps > 65000ULL) kbps = 65000ULL;
+                        s_spd_dl_kbps = (uint16_t)kbps;
+                    }
+                }
+                http.end();
+            }
+        }
+
+        snprintf(msg, sizeof(msg), "ESP32:SPD,ST=1,PING=%u,DL=%u,LINK=0\n",
+                 (unsigned int)s_spd_ping_ms, (unsigned int)s_spd_dl_kbps);
+        stm32_uart_send(msg);
+        s_uart_tx_cnt++;
+    }
+
+    /* Stage 3: USART6 STM32 <-> ESP32-C6 32 KB Binary Link Throughput Benchmark */
+    s_rpc_strm_done  = false;
+    s_rpc_strm_ok    = false;
+    s_rpc_strm_total = 0;
+
+    stm32_uart_send("ESP32:SPD_BURST,32\n");
+    s_uart_tx_cnt++;
+
+    uint32_t t_wait = millis();
+    while (!s_rpc_strm_done && (millis() - t_wait) < 1500U)
+    {
+        poll_stm32_uart();
+        delay(1);
+    }
+
+    if (s_rpc_strm_done && s_rpc_strm_ok && s_rpc_strm_total > 0U)
+    {
+        uint32_t remaining = s_rpc_strm_total;
+        uint32_t rx_total  = 0U;
+        uint8_t  raw[1024];
+        uint32_t t_lnk0 = micros();
+
+        while (remaining > 0U)
+        {
+            uart_write_bytes(UART_NUM_1, "K", 1);
+            s_uart_tx_bytes++;
+
+            size_t to_read = (remaining > sizeof(raw)) ? sizeof(raw) : (size_t)remaining;
+            size_t got = 0U;
+            uint32_t chunk_t0 = millis();
+            while (got < to_read && (millis() - chunk_t0) < 1000U)
+            {
+                int r = uart_read_bytes(UART_NUM_1, raw + got, to_read - got, pdMS_TO_TICKS(15));
+                if (r > 0)
+                {
+                    got += (size_t)r;
+                    s_uart_rx_bytes += (uint32_t)r;
+                    s_last_stm32_rx = millis();
+                }
+            }
+            if (got == 0U) break;
+            remaining -= (uint32_t)got;
+            rx_total  += (uint32_t)got;
+        }
+
+        uint32_t dt_us = micros() - t_lnk0;
+        if (rx_total > 0U && dt_us > 0U)
+        {
+            /* 0.1 KB/s = (bytes * 10,000,000) / (1024 * dt_us) */
+            uint64_t kbs_x10 = ((uint64_t)rx_total * 10000000ULL) / (1024ULL * (uint64_t)dt_us);
+            if (kbs_x10 > 9999ULL) kbs_x10 = 9999ULL;
+            s_spd_link_x10 = (uint16_t)kbs_x10;
+        }
+    }
+
+    snprintf(msg, sizeof(msg), "ESP32:SPD,ST=2,PING=%u,DL=%u,LINK=%u\n",
+             (unsigned int)s_spd_ping_ms,
+             (unsigned int)s_spd_dl_kbps,
+             (unsigned int)s_spd_link_x10);
+    stm32_uart_send(msg);
+    s_uart_tx_cnt++;
+    Serial.printf("[SPD] Done: Ping=%u ms, WiFi=%u kbps, UART6=%u.%u KB/s\r\n",
+                  (unsigned)s_spd_ping_ms, (unsigned)s_spd_dl_kbps,
+                  (unsigned)(s_spd_link_x10 / 10U), (unsigned)(s_spd_link_x10 % 10U));
 }
 
 static void web_setup_routes(void)
@@ -1370,6 +1681,52 @@ static void web_setup_routes(void)
         s_web.send(200, "application/json", "{\"ok\":true}");
     });
 
+    s_web.on("/api/screenshot", HTTP_POST, []() {
+        s_rpc_shot_done = false;
+        s_rpc_shot_ok   = false;
+        s_rpc_shot_path = "";
+        stm32_uart_send("ESP32:SCREENSHOT\n");
+        s_uart_tx_cnt++;
+
+        uint32_t t0 = millis();
+        while (!s_rpc_shot_done && (millis() - t0) < 3500U)
+        {
+            poll_stm32_uart();
+            delay(1);
+        }
+        if (s_rpc_shot_done && s_rpc_shot_ok && s_rpc_shot_path.length() > 0)
+        {
+            String out = "{\"ok\":true,\"path\":\"" + s_rpc_shot_path + "\"}";
+            s_web.send(200, "application/json", out);
+        }
+        else
+        {
+            s_web.send(500, "application/json", "{\"ok\":false}");
+        }
+    });
+
+    s_web.on("/api/input", HTTP_POST, []() {
+        uint16_t mask = (uint16_t)s_web.arg("mask").toInt();
+        int lx        = constrain(s_web.arg("lx").toInt(), -127, 127);
+        int ly        = constrain(s_web.arg("ly").toInt(), -127, 127);
+        char cmd[48];
+        snprintf(cmd, sizeof(cmd), "ESP32:VPAD,%u,%d,%d\n", (unsigned int)mask, lx, ly);
+        stm32_uart_send(cmd);
+        s_uart_tx_cnt++;
+        s_web.send(200, "application/json", "{\"ok\":true}");
+    });
+
+    s_web.on("/api/speedtest", HTTP_POST, []() {
+        run_speedtest_now();
+        char out[128];
+        snprintf(out, sizeof(out),
+                 "{\"ok\":true,\"ping_ms\":%u,\"dl_kbps\":%u,\"link_kbs_x10\":%u}",
+                 (unsigned int)s_spd_ping_ms,
+                 (unsigned int)s_spd_dl_kbps,
+                 (unsigned int)s_spd_link_x10);
+        s_web.send(200, "application/json", out);
+    });
+
     s_web.begin();
 }
 
@@ -1412,7 +1769,14 @@ void loop()
         if (!digitalRead(BOOT_BTN_PIN))
         {
             s_boot_presses++;
-            s_screen_idx = (s_screen_idx + 1U) % 3U;
+            if (s_game_hud_mode)
+            {
+                s_game_hud_mode = false;
+            }
+            else
+            {
+                s_screen_idx = (s_screen_idx + 1U) % 3U;
+            }
             draw_static_ui();
             update_dynamic_ui();
 
@@ -1424,6 +1788,12 @@ void loop()
 
     poll_stm32_uart();
     s_web.handleClient();
+
+    if (s_spd_req_now)
+    {
+        s_spd_req_now = false;
+        run_speedtest_now();
+    }
 
     if (WiFi.status() == WL_CONNECTED && !s_mdns_started)
     {
