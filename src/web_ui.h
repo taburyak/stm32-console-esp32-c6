@@ -156,28 +156,28 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
     <div id="padBox" class="pad-box">
       <div class="dpad">
         <div></div>
-        <button class="pad-btn" data-bit="16">▲</button>
+        <button class="pad-btn" data-bit="4">▲</button>
         <div></div>
         <button class="pad-btn" data-bit="1">◀</button>
         <div style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem">D-PAD</div>
         <button class="pad-btn" data-bit="2">▶</button>
         <div></div>
-        <button class="pad-btn" data-bit="32">▼</button>
+        <button class="pad-btn" data-bit="8">▼</button>
         <div></div>
       </div>
       <div style="display:flex;flex-direction:column;gap:8px;align-items:center">
         <div style="display:flex;gap:8px">
           <button class="pad-btn btn-amber" data-bit="256" style="padding:6px 14px">⏯ START</button>
-          <button class="pad-btn btn-red" data-bit="8" style="padding:6px 14px">⎋ EXIT / ESC</button>
+          <button class="pad-btn btn-red" data-bit="128" style="padding:6px 14px">⎋ EXIT / ESC</button>
         </div>
         <label style="font-size:0.76rem;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:6px">
-          <input type="checkbox" id="chkKbPad" checked> PC Keyboard (Arrows / WASD, Space=A, Z=B, C=X, Enter/Esc)
+          <input type="checkbox" id="chkKbPad" checked> PC Keyboard (Arrows / WASD, Enter/Space=A, Z/Backspace=B, C=X, Esc=Exit)
         </label>
       </div>
       <div class="act-pad">
-        <button class="pad-btn" data-bit="128" style="border-color:var(--accent)">X</button>
-        <button class="pad-btn btn-green" data-bit="4">A (OK)</button>
-        <button class="pad-btn btn-amber" data-bit="64">B</button>
+        <button class="pad-btn" data-bit="64" style="border-color:var(--accent)">X</button>
+        <button class="pad-btn btn-green" data-bit="16">A (OK)</button>
+        <button class="pad-btn btn-amber" data-bit="32">B (Back)</button>
         <button class="pad-btn" onclick="captureScreen()">📸 Shot</button>
       </div>
     </div>
@@ -645,9 +645,12 @@ async function captureScreen(){
 let padOpen = false;
 let padMask = 0;
 let padTimer = null;
+let padQueue = Promise.resolve();
 
-function sendPadNow(){
-  fetch('/api/input?mask=' + padMask + '&lx=0&ly=0', {method:'POST'}).catch(() => {});
+function sendPadMask(m){
+  padQueue = padQueue.then(() =>
+    fetch('/api/input?mask=' + m + '&lx=0&ly=0', {method:'POST'}).catch(() => {})
+  );
 }
 
 function setPadBit(bit, down){
@@ -658,11 +661,11 @@ function setPadBit(bit, down){
     const bb = parseInt(b.dataset.bit, 10);
     b.classList.toggle('held', (padMask & bb) !== 0);
   });
-  sendPadNow();
+  sendPadMask(padMask);
   if(padMask !== 0 && !padTimer){
     padTimer = setInterval(() => {
       if(padMask === 0){ clearInterval(padTimer); padTimer = null; return; }
-      sendPadNow();
+      sendPadMask(padMask);
     }, 280);
   }
 }
@@ -673,7 +676,7 @@ function toggleGamepad(){
   document.getElementById('btnPadToggle').classList.toggle('btn-accent', padOpen);
   if(!padOpen && padMask !== 0){
     padMask = 0;
-    sendPadNow();
+    sendPadMask(0);
   }
 }
 
@@ -687,22 +690,25 @@ document.querySelectorAll('.pad-btn[data-bit]').forEach(btn => {
   btn.addEventListener('pointercancel', rel);
 });
 
+/* Exact SDK_KEY_* bitmask mapping from console_abi.h:
+ * 1=LEFT, 2=RIGHT, 4=UP, 8=DOWN, 16=A(Enter), 32=B(Back), 64=X, 128=EXIT(Esc), 256=START */
 const KB_MAP = {
   'ArrowLeft': 1, 'KeyA': 1,
   'ArrowRight': 2, 'KeyD': 2,
-  'ArrowUp': 16, 'KeyW': 16,
-  'ArrowDown': 32, 'KeyS': 32,
-  'Space': 4, 'Enter': 4,
-  'KeyZ': 64, 'KeyX': 64,
-  'KeyC': 128,
-  'KeyP': 256,
-  'Escape': 8
+  'ArrowUp': 4, 'KeyW': 4,
+  'ArrowDown': 8, 'KeyS': 8,
+  'Space': 16, 'Enter': 16, 'NumpadEnter': 16,
+  'KeyZ': 32, 'KeyX': 32, 'Backspace': 32,
+  'KeyC': 64,
+  'Escape': 128,
+  'KeyP': 256
 };
 
 window.addEventListener('keydown', (e) => {
   if(!padOpen || !document.getElementById('chkKbPad').checked) return;
-  const tag = (document.activeElement && document.activeElement.tagName) || '';
-  if(tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') return;
+  const el = document.activeElement;
+  const tag = (el && el.tagName) || '';
+  if(tag === 'TEXTAREA' || tag === 'SELECT' || (tag === 'INPUT' && el.type !== 'checkbox')) return;
   const bit = KB_MAP[e.code];
   if(bit){
     e.preventDefault();

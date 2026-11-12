@@ -1172,25 +1172,32 @@ static void stm32_uart_send(const char *str)
 
 static void poll_stm32_uart(void)
 {
-    uint8_t rx_buf[128];
-    int rx_len = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), 0);
-    for (int i = 0; i < rx_len; i++)
+    uint8_t rx_buf[256];
+    int rx_len = 0;
+    while ((rx_len = uart_read_bytes(UART_NUM_1, rx_buf, sizeof(rx_buf), 0)) > 0)
     {
-        char c = (char)rx_buf[i];
-        s_uart_rx_bytes++;
-
-        if (c == '\n' || c == '\r')
+        for (int i = 0; i < rx_len; i++)
         {
-            if (s_rx_line_len > 0)
+            char c = (char)rx_buf[i];
+            s_uart_rx_bytes++;
+
+            if (c == '\n' || c == '\r')
             {
-                s_rx_line[s_rx_line_len] = '\0';
-                handle_stm32_packet(s_rx_line);
-                s_rx_line_len = 0;
+                if (s_rx_line_len > 0)
+                {
+                    s_rx_line[s_rx_line_len] = '\0';
+                    handle_stm32_packet(s_rx_line);
+                    s_rx_line_len = 0;
+                }
+            }
+            else if (s_rx_line_len < (sizeof(s_rx_line) - 1))
+            {
+                s_rx_line[s_rx_line_len++] = c;
             }
         }
-        else if (s_rx_line_len < (sizeof(s_rx_line) - 1))
+        if (s_rpc_strm_done)
         {
-            s_rx_line[s_rx_line_len++] = c;
+            break;
         }
     }
 }
@@ -1219,56 +1226,76 @@ static void run_speedtest_now(void)
     /* Stage 1 & 2: Internet HTTP Latency + Download Speed (only if Wi-Fi AP connected) */
     if (WiFi.status() == WL_CONNECTED)
     {
-        HTTPClient http;
-        http.setTimeout(3500);
+        /* Stage 1: Dedicated non-reused client for HTTP RTT ping */
+        {
+            WiFiClient ping_cli;
+            HTTPClient http_ping;
+            http_ping.setReuse(false);
+            http_ping.setConnectTimeout(2000);
+            http_ping.setTimeout(2500);
 
-        /* Stage 1: Low-latency HTTP RTT ping against Cloudflare OTP edge */
-        uint32_t p0 = millis();
-        if (http.begin("http://speed.cloudflare.com/__down?bytes=0"))
-        {
-            int code = http.GET();
-            if (code > 0)
+            uint32_t p0 = millis();
+            if (http_ping.begin(ping_cli, "http://speed.cloudflare.com/__down?bytes=0"))
             {
-                uint32_t dt = millis() - p0;
-                s_spd_ping_ms = (uint16_t)((dt > 0U) ? dt : 1U);
+                int code = http_ping.GET();
+                if (code > 0)
+                {
+                    uint32_t dt = millis() - p0;
+                    s_spd_ping_ms = (uint16_t)((dt > 0U) ? dt : 1U);
+                }
+                http_ping.end();
             }
-            http.end();
         }
-        if (s_spd_ping_ms == 0U && http.begin("http://connectivitycheck.gstatic.com/generate_204"))
+        if (s_spd_ping_ms == 0U)
         {
-            p0 = millis();
-            if (http.GET() > 0)
+            WiFiClient ping_cli2;
+            HTTPClient http_ping2;
+            http_ping2.setReuse(false);
+            http_ping2.setConnectTimeout(2000);
+            http_ping2.setTimeout(2500);
+
+            uint32_t p0 = millis();
+            if (http_ping2.begin(ping_cli2, "http://connectivitycheck.gstatic.com/generate_204"))
             {
-                uint32_t dt = millis() - p0;
-                s_spd_ping_ms = (uint16_t)((dt > 0U) ? dt : 1U);
+                if (http_ping2.GET() > 0)
+                {
+                    uint32_t dt = millis() - p0;
+                    s_spd_ping_ms = (uint16_t)((dt > 0U) ? dt : 1U);
+                }
+                http_ping2.end();
             }
-            http.end();
         }
 
         snprintf(msg, sizeof(msg), "ESP32:SPD,ST=1,PING=%u,DL=0,LINK=0\n", (unsigned int)s_spd_ping_ms);
         stm32_uart_send(msg);
         s_uart_tx_cnt++;
 
-        /* Stage 2: 1 MB HTTP stream download benchmark from Cloudflare CDN */
+        /* Stage 2: Dedicated non-reused client for 512 KB HTTP stream download */
         const char * const dl_urls[2] = {
-            "http://speed.cloudflare.com/__down?bytes=1048576",
+            "http://speed.cloudflare.com/__down?bytes=524288",
             "http://ipv4.download.thinkbroadband.com/5MB.zip"
         };
         for (int u = 0; u < 2 && s_spd_dl_kbps == 0U; u++)
         {
-            if (http.begin(dl_urls[u]))
+            WiFiClient dl_cli;
+            HTTPClient http_dl;
+            http_dl.setReuse(false);
+            http_dl.setConnectTimeout(2500);
+            http_dl.setTimeout(3000);
+
+            if (http_dl.begin(dl_cli, dl_urls[u]))
             {
-                int code = http.GET();
+                int code = http_dl.GET();
                 if (code == 200)
                 {
-                    WiFiClient *stream = http.getStreamPtr();
+                    WiFiClient *stream = http_dl.getStreamPtr();
                     static uint8_t dl_buf[4096];
                     uint32_t got_bytes = 0U;
-                    uint32_t target_bytes = 1048576UL;
+                    uint32_t target_bytes = 524288UL;
                     uint32_t t_dl0 = millis();
-                    while ((http.connected() || stream->available() > 0) &&
+                    while ((http_dl.connected() || stream->available() > 0) &&
                            got_bytes < target_bytes &&
-                           (millis() - t_dl0) < 4000U)
+                           (millis() - t_dl0) < 3000U)
                     {
                         size_t avail = stream->available();
                         if (avail > 0)
@@ -1282,15 +1309,14 @@ static void run_speedtest_now(void)
                         }
                     }
                     uint32_t elapsed_ms = millis() - t_dl0;
-                    poll_stm32_uart();
-                    if (got_bytes >= 32768UL && elapsed_ms > 0U)
+                    if (got_bytes >= 16384UL && elapsed_ms > 0U)
                     {
                         uint64_t kbps = ((uint64_t)got_bytes * 8ULL) / (uint64_t)elapsed_ms;
                         if (kbps > 65000ULL) kbps = 65000ULL;
                         s_spd_dl_kbps = (uint16_t)kbps;
                     }
                 }
-                http.end();
+                http_dl.end();
             }
         }
 
@@ -1300,7 +1326,10 @@ static void run_speedtest_now(void)
         s_uart_tx_cnt++;
     }
 
-    /* Stage 3: USART6 STM32 <-> ESP32-C6 32 KB Binary Link Throughput Benchmark */
+    /* Stage 3: Drain stale HB lines, then run 32 KB USART6 Binary Link Benchmark */
+    poll_stm32_uart();
+    uart_flush_input(UART_NUM_1);
+    s_rx_line_len    = 0;
     s_rpc_strm_done  = false;
     s_rpc_strm_ok    = false;
     s_rpc_strm_total = 0;
@@ -1309,7 +1338,7 @@ static void run_speedtest_now(void)
     s_uart_tx_cnt++;
 
     uint32_t t_wait = millis();
-    while (!s_rpc_strm_done && (millis() - t_wait) < 1500U)
+    while (!s_rpc_strm_done && (millis() - t_wait) < 2000U)
     {
         poll_stm32_uart();
         delay(1);
@@ -1330,7 +1359,7 @@ static void run_speedtest_now(void)
             size_t to_read = (remaining > sizeof(raw)) ? sizeof(raw) : (size_t)remaining;
             size_t got = 0U;
             uint32_t chunk_t0 = millis();
-            while (got < to_read && (millis() - chunk_t0) < 1000U)
+            while (got < to_read && (millis() - chunk_t0) < 800U)
             {
                 int r = uart_read_bytes(UART_NUM_1, raw + got, to_read - got, pdMS_TO_TICKS(15));
                 if (r > 0)
@@ -1340,7 +1369,12 @@ static void run_speedtest_now(void)
                     s_last_stm32_rx = millis();
                 }
             }
-            if (got == 0U) break;
+            if (got == 0U)
+            {
+                uart_write_bytes(UART_NUM_1, "X", 1);
+                delay(15);
+                break;
+            }
             remaining -= (uint32_t)got;
             rx_total  += (uint32_t)got;
         }
@@ -1348,11 +1382,16 @@ static void run_speedtest_now(void)
         uint32_t dt_us = micros() - t_lnk0;
         if (rx_total > 0U && dt_us > 0U)
         {
-            /* 0.1 KB/s = (bytes * 10,000,000) / (1024 * dt_us) */
             uint64_t kbs_x10 = ((uint64_t)rx_total * 10000000ULL) / (1024ULL * (uint64_t)dt_us);
             if (kbs_x10 > 9999ULL) kbs_x10 = 9999ULL;
             s_spd_link_x10 = (uint16_t)kbs_x10;
         }
+    }
+    else
+    {
+        /* Ensure STM32 exits WaitForStreamAck before sending ASCII ST=2 frame */
+        uart_write_bytes(UART_NUM_1, "X", 1);
+        delay(20);
     }
 
     snprintf(msg, sizeof(msg), "ESP32:SPD,ST=2,PING=%u,DL=%u,LINK=%u\n",
@@ -1360,7 +1399,9 @@ static void run_speedtest_now(void)
              (unsigned int)s_spd_dl_kbps,
              (unsigned int)s_spd_link_x10);
     stm32_uart_send(msg);
-    s_uart_tx_cnt++;
+    delay(15);
+    stm32_uart_send(msg);
+    s_uart_tx_cnt += 2;
     Serial.printf("[SPD] Done: Ping=%u ms, WiFi=%u kbps, UART6=%u.%u KB/s\r\n",
                   (unsigned)s_spd_ping_ms, (unsigned)s_spd_dl_kbps,
                   (unsigned)(s_spd_link_x10 / 10U), (unsigned)(s_spd_link_x10 % 10U));
