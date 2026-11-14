@@ -143,6 +143,8 @@ static uint16_t  s_spd_link_x10   = 0;
 static bool      s_game_hud_mode  = false;
 static bool      s_game_led_ovr   = false;
 static char      s_game_lines[6][52] = {{0}};
+static bool      s_screensaver_mode = false;
+static uint8_t   s_saved_screen_idx = 0U;
 
 static bool      s_rpc_rd_done   = false;
 static bool      s_rpc_rd_ok     = false;
@@ -339,7 +341,7 @@ static void lcd_init(void)
     lcd_cmd(0x29); /* DISPON */
     delay(20);
 
-    digitalWrite(LCD_PIN_BL, HIGH);
+    analogWrite(LCD_PIN_BL, 255);
 }
 
 /* ==========================================================================
@@ -415,7 +417,8 @@ static void draw_static_ui(void)
         "2/3 STM32 CONSOLE",
         "3/3 WEATHER & CLOCK"
     };
-    lcd_draw_text(8, 5, kScreenTitles[s_screen_idx % 3U], thm.accent565, thm.bar565, 2);
+    lcd_draw_text(8, 5, s_screensaver_mode ? "STANDBY WEATHER" : kScreenTitles[s_screen_idx % 3U],
+                  thm.accent565, thm.bar565, 2);
 
     /* Info Cards */
     lcd_fill_rect(8, 30, 304, 58, COL_CARD);
@@ -968,6 +971,11 @@ static void handle_stm32_packet(const char *pkt)
     {
         s_last_stm32_rx = millis();
         s_uart_rx_cnt++;
+        if (s_screensaver_mode)
+        {
+            s_screensaver_mode = false;
+            analogWrite(LCD_PIN_BL, 255);
+        }
         memset(s_game_lines, 0, sizeof(s_game_lines));
         s_game_hud_mode = true;
         draw_static_ui();
@@ -1021,6 +1029,29 @@ static void handle_stm32_packet(const char *pkt)
             s_game_led_ovr  = false;
             draw_static_ui();
             update_dynamic_ui();
+        }
+        return;
+    }
+
+    if ((p_cmd = strstr(pkt, "IDLE,")) != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        bool enter_idle = (atoi(p_cmd + 5) != 0);
+        if (enter_idle && !s_screensaver_mode)
+        {
+            s_saved_screen_idx = s_screen_idx;
+            s_screensaver_mode = true;
+            s_screen_idx       = 2U; /* Weather & Clock screen */
+            analogWrite(LCD_PIN_BL, 48);
+            draw_static_ui();
+        }
+        else if (!enter_idle && s_screensaver_mode)
+        {
+            s_screensaver_mode = false;
+            s_screen_idx       = s_saved_screen_idx;
+            analogWrite(LCD_PIN_BL, 255);
+            draw_static_ui();
         }
         return;
     }
@@ -1810,7 +1841,13 @@ void loop()
         if (!digitalRead(BOOT_BTN_PIN))
         {
             s_boot_presses++;
-            if (s_game_hud_mode)
+            if (s_screensaver_mode)
+            {
+                s_screensaver_mode = false;
+                s_screen_idx       = s_saved_screen_idx;
+                analogWrite(LCD_PIN_BL, 255);
+            }
+            else if (s_game_hud_mode)
             {
                 s_game_hud_mode = false;
             }
