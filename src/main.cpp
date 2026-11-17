@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <time.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -1798,6 +1799,100 @@ static void web_setup_routes(void)
                  (unsigned int)s_spd_link_x10);
         s_web.send(200, "application/json", out);
     });
+
+    s_web.on("/api/sys/reboot", HTTP_POST, []() {
+        s_rpc_ack_done = false;
+        s_rpc_ack_ok   = false;
+        stm32_uart_send("ESP32:SYS_REBOOT\n");
+        s_uart_tx_cnt++;
+        bool ok = rpc_wait_ack(1000U);
+        s_web.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    s_web.on("/api/ota/esp32", HTTP_POST,
+        []() {
+            bool ok = !Update.hasError();
+            s_web.sendHeader("Connection", "close");
+            if (ok)
+            {
+                s_web.send(200, "application/json", "{\"ok\":true}");
+                lcd_draw_text(20, 128, "OTA OK! Rebooting...        ", COL_GREEN, COL_CARD, 1);
+                rgbLedWrite(RGB_LED_PIN, 64, 0, 0);
+                delay(400);
+                ESP.restart();
+            }
+            else
+            {
+                String err = Update.errorString();
+                err.replace("\"", "'");
+                s_web.send(500, "application/json", "{\"ok\":false,\"err\":\"" + err + "\"}");
+                draw_static_ui();
+                update_dynamic_ui();
+            }
+        },
+        []() {
+            static uint32_t s_ota_written = 0;
+            static uint32_t s_ota_expected = 0;
+            HTTPUpload &up = s_web.upload();
+            if (up.status == UPLOAD_FILE_START)
+            {
+                s_ota_written = 0;
+                s_ota_expected = (uint32_t)s_web.arg("size").toInt();
+                if (s_ota_expected == 0U) s_ota_expected = (uint32_t)up.totalSize;
+                if (s_ota_expected == 0U) s_ota_expected = 1250000UL;
+
+                Serial.printf("[OTA] Start: %s (expected=%lu)\r\n", up.filename.c_str(), (unsigned long)s_ota_expected);
+                const CompanionTheme &thm = kThemes[s_theme_idx];
+                lcd_fill_rect(0, 0, LCD_W, LCD_H, thm.bg565);
+                lcd_fill_rect(0, 0, LCD_W, 24, thm.bar565);
+                lcd_fill_rect(0, 24, LCD_W, 2, thm.accent565);
+                lcd_draw_text(8, 5, "ESP32-C6 WIFI OTA", thm.accent565, thm.bar565, 2);
+                lcd_fill_rect(12, 42, 296, 108, COL_CARD);
+                lcd_fill_rect(12, 42, 3, 108, COL_YELLOW);
+                lcd_draw_text(20, 52, "Flashing OTA partition...", COL_WHITE, COL_CARD, 1);
+                lcd_fill_rect(20, 82, 280, 18, thm.bg565);
+                rgbLedWrite(RGB_LED_PIN, 0, 0, 64);
+
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH))
+                {
+                    Update.printError(Serial);
+                }
+            }
+            else if (up.status == UPLOAD_FILE_WRITE)
+            {
+                if (Update.write(up.buf, up.currentSize) != up.currentSize)
+                {
+                    Update.printError(Serial);
+                }
+                s_ota_written += up.currentSize;
+                uint32_t pct = (s_ota_written * 100UL) / s_ota_expected;
+                if (pct > 100UL) pct = 100UL;
+                int16_t bar_w = (int16_t)((276UL * pct) / 100UL);
+                if (bar_w > 0) lcd_fill_rect(22, 84, bar_w, 14, COL_GREEN);
+                char pbuf[32];
+                snprintf(pbuf, sizeof(pbuf), "Written: %lu KB (%lu%%)   ",
+                         (unsigned long)(s_ota_written / 1024UL), (unsigned long)pct);
+                lcd_draw_text(20, 110, pbuf, COL_YELLOW, COL_CARD, 1);
+            }
+            else if (up.status == UPLOAD_FILE_END)
+            {
+                if (Update.end(true))
+                {
+                    Serial.printf("[OTA] Success: %u bytes\r\n", (unsigned)up.totalSize);
+                }
+                else
+                {
+                    Update.printError(Serial);
+                }
+            }
+            else if (up.status == UPLOAD_FILE_ABORTED)
+            {
+                Update.end(false);
+                draw_static_ui();
+                update_dynamic_ui();
+            }
+        }
+    );
 
     s_web.begin();
 }

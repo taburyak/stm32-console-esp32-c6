@@ -61,6 +61,8 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
 .act-pad{display:grid;grid-template-columns:repeat(2,64px);gap:8px}
 .pad-btn{justify-content:center;font-weight:700;font-size:0.86rem;border-radius:8px;padding:8px;touch-action:none}
 .pad-btn.held{background:var(--accent)!important;color:#000!important;border-color:#fff!important;transform:scale(0.96)}
+.ota-box{background:#0d1421;border-top:1px solid var(--border);padding:12px 16px;display:none;flex-direction:column;gap:10px}
+.ota-row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;background:var(--card);padding:8px 12px;border-radius:8px;border:1px solid var(--border)}
 </style>
 </head>
 <body>
@@ -77,6 +79,7 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
     <div class="tele-item">STM32 Heap: <b id="tHeap">--</b></div>
     <button class="btn-amber" onclick="captureScreen()" title="Capture live 320x240 display to SD:/screenshots and preview">📸 Capture Screen</button>
     <button id="btnPadToggle" onclick="toggleGamepad()" title="Toggle Virtual Web Gamepad">🎮 Gamepad</button>
+    <button id="btnOtaToggle" onclick="toggleOta()" title="Wireless OTA Firmware Update for ESP32-C6 & STM32F407">⚡ OTA</button>
     <div class="tele-item">Theme:
       <select id="thmSel" onchange="setTheme(this.value)">
         <option value="0">Cyber Blue</option>
@@ -179,6 +182,28 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
         <button class="pad-btn btn-green" data-bit="16">A (OK)</button>
         <button class="pad-btn btn-amber" data-bit="32">B (Back)</button>
         <button class="pad-btn" onclick="captureScreen()">📸 Shot</button>
+      </div>
+    </div>
+    <div id="otaBox" class="ota-box">
+      <div class="ota-row">
+        <div>
+          <b style="color:var(--accent)">ESP32-C6 Companion OTA</b>
+          <div style="font-size:0.76rem;color:var(--muted)">Select PlatformIO <code>firmware.bin</code> to flash dual-OTA slot over Wi-Fi</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="file" id="espOtaFile" accept=".bin" style="font-size:0.78rem">
+          <button class="btn-accent" onclick="uploadEspOta()">⚡ Flash ESP32</button>
+        </div>
+      </div>
+      <div class="ota-row">
+        <div>
+          <b style="color:var(--green)">STM32F407 Console OTA</b>
+          <div style="font-size:0.76rem;color:var(--muted)">Select <code>fw_update.bin</code> (stages to <code>SD:/system/fw_update.bin</code> &amp; reboots into Bootloader)</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="file" id="stmOtaFile" accept=".bin" style="font-size:0.78rem">
+          <button class="btn-green" onclick="uploadStm32Ota()">⚡ Flash STM32</button>
+        </div>
       </div>
     </div>
     <div class="status-bar">
@@ -724,6 +749,76 @@ window.addEventListener('keyup', (e) => {
     setPadBit(bit, false);
   }
 });
+
+let otaOpen = false;
+function toggleOta(){
+  otaOpen = !otaOpen;
+  document.getElementById('otaBox').style.display = otaOpen ? 'flex' : 'none';
+  document.getElementById('btnOtaToggle').classList.toggle('btn-accent', otaOpen);
+}
+
+function uploadEspOta(){
+  const inp = document.getElementById('espOtaFile');
+  if(!inp.files || !inp.files[0]) return alert('Select ESP32 firmware.bin first!');
+  const f = inp.files[0];
+  if(!confirm('Flash ESP32-C6 OTA firmware "' + f.name + '" (' + formatBytes(f.size) + ')?')) return;
+  busyCount++;
+  setStatus('Uploading ESP32-C6 OTA firmware (' + formatBytes(f.size) + ')...', 'var(--amber)');
+  setProgress(5);
+  const fd = new FormData();
+  fd.append('firmware', f, f.name);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota/esp32?size=' + f.size, true);
+  xhr.upload.onprogress = (ev) => {
+    if(ev.lengthComputable){
+      const pct = Math.round((ev.loaded * 100) / ev.total);
+      setProgress(pct);
+      setStatus('Flashing ESP32-C6 OTA: ' + pct + '%', 'var(--amber)');
+    }
+  };
+  xhr.onload = () => {
+    busyCount = Math.max(0, busyCount - 1);
+    if(xhr.status === 200){
+      setProgress(100);
+      setStatus('ESP32-C6 OTA complete! Rebooting... Reloading page in 5s.', 'var(--green)');
+      inp.value = '';
+      setTimeout(() => location.reload(), 5000);
+    } else {
+      setProgress(0);
+      setStatus('ESP32-C6 OTA failed: ' + xhr.responseText, 'var(--red)');
+    }
+  };
+  xhr.onerror = () => {
+    busyCount = Math.max(0, busyCount - 1);
+    setProgress(0);
+    setStatus('ESP32-C6 OTA network error.', 'var(--red)');
+  };
+  xhr.send(fd);
+}
+
+async function uploadStm32Ota(){
+  const inp = document.getElementById('stmOtaFile');
+  if(!inp.files || !inp.files[0]) return alert('Select STM32 fw_update.bin first!');
+  const f = inp.files[0];
+  const buf = new Uint8Array(await f.arrayBuffer());
+  if(buf.length < 64 || buf[0] !== 0x34 || buf[1] !== 0x57 || buf[2] !== 0x46 || buf[3] !== 0x55){
+    return alert('Invalid STM32 firmware package! Expected fw_update.bin with 4WFU header.');
+  }
+  if(!confirm('Stage "' + f.name + '" (' + formatBytes(f.size) + ') to SD:/system/fw_update.bin and reboot STM32 into Bootloader?')) return;
+  setStatus('Uploading STM32 firmware to SD:/system/fw_update.bin...', 'var(--amber)');
+  await fetch('/api/fs/mkdir?path=/system', {method:'POST'}).catch(() => {});
+  const ok = await writeBytesChunked('/system/fw_update.bin', buf);
+  if(!ok){
+    setProgress(0);
+    setStatus('Failed to write SD:/system/fw_update.bin!', 'var(--red)');
+    return;
+  }
+  setProgress(100);
+  setStatus('Staged fw_update.bin! Rebooting STM32 into Bootloader...', 'var(--green)');
+  inp.value = '';
+  await fetch('/api/sys/reboot', {method:'POST'}).catch(() => {});
+  setTimeout(() => setProgress(0), 1500);
+}
 
 function loadTemplate(){
   if(isDirty && !confirm('Replace editor content with Dual-Screen C-Script template?')) return;
