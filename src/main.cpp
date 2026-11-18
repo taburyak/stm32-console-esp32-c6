@@ -528,14 +528,14 @@ static void render_screen_stm32_console(void)
     }
 
     /* Bottom Card: STM32 Memory Architecture */
-    snprintf(line, sizeof(line), "RTOS Heap: %3lu / 304 KB (Min:%3lu KB)",
+    snprintf(line, sizeof(line), "RTOS Heap: %3lu / 143 KB (Min:%3lu KB)",
              (unsigned long)s_stm32_heap,
              (unsigned long)((s_stm32_min_heap > 0) ? s_stm32_min_heap : s_stm32_heap));
     lcd_draw_text(18, 98, line, COL_GREEN, COL_CARD, 1);
 
-    lcd_draw_text(18, 114, "Int SRAM:  128 KB (OS:96K App:32K)  ", COL_WHITE, COL_CARD, 1);
+    lcd_draw_text(18, 114, "Int SRAM:  128 KB (OS:64K App:64K)  ", COL_WHITE, COL_CARD, 1);
     lcd_draw_text(18, 130, "CCM RAM:   64 KB  (Zero-Wait D-Bus) ", COL_WHITE, COL_CARD, 1);
-    lcd_draw_text(18, 146, "Ext SRAM:  1024 KB FSMC | Flash: 1MB", COL_YELLOW, COL_CARD, 1);
+    lcd_draw_text(18, 146, "Ext SRAM:  1024 KB (LVGL:128K+512K) ", COL_YELLOW, COL_CARD, 1);
 }
 
 static void render_screen_weather_clock(void)
