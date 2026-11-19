@@ -141,9 +141,10 @@ static uint16_t  s_spd_ping_ms    = 0;
 static uint16_t  s_spd_dl_kbps    = 0;
 static uint16_t  s_spd_link_x10   = 0;
 
-static bool      s_game_hud_mode  = false;
-static bool      s_game_led_ovr   = false;
-static char      s_game_lines[6][52] = {{0}};
+static bool      s_game_hud_mode       = false;
+static bool      s_game_hud_persistent = false;
+static bool      s_game_led_ovr        = false;
+static char      s_game_lines[6][52]   = {{0}};
 static bool      s_screensaver_mode = false;
 static uint8_t   s_saved_screen_idx = 0U;
 
@@ -982,6 +983,18 @@ static void handle_stm32_packet(const char *pkt)
         draw_static_ui();
         return;
     }
+    if ((p_cmd = strstr(pkt, "GHUD_KEEP,")) != NULL)
+    {
+        s_last_stm32_rx = millis();
+        s_uart_rx_cnt++;
+        s_game_hud_persistent = (atoi(p_cmd + 10) != 0);
+        if (s_game_hud_persistent)
+        {
+            s_game_hud_mode = true;
+            draw_static_ui();
+        }
+        return;
+    }
     if ((p_cmd = strstr(pkt, "GHUD_LN,")) != NULL)
     {
         s_last_stm32_rx = millis();
@@ -1026,8 +1039,9 @@ static void handle_stm32_packet(const char *pkt)
         s_uart_rx_cnt++;
         if (s_game_hud_mode || s_game_led_ovr)
         {
-            s_game_hud_mode = false;
-            s_game_led_ovr  = false;
+            s_game_hud_mode       = false;
+            s_game_hud_persistent = false;
+            s_game_led_ovr        = false;
             draw_static_ui();
             update_dynamic_ui();
         }
@@ -1113,7 +1127,8 @@ static void handle_stm32_packet(const char *pkt)
             eol = strchr(s_stm32_app, '\n');
             if (eol) *eol = '\0';
 
-            if (strcmp(s_stm32_app, "menu") == 0 && (s_game_hud_mode || s_game_led_ovr))
+            if (strcmp(s_stm32_app, "menu") == 0 && !s_game_hud_persistent &&
+                (s_game_hud_mode || s_game_led_ovr))
             {
                 s_game_hud_mode = false;
                 s_game_led_ovr  = false;
@@ -1448,9 +1463,10 @@ static void web_setup_routes(void)
     s_web.on("/api/status", HTTP_GET, []() {
         poll_stm32_uart();
         s_stm32_online = (millis() - s_last_stm32_rx) < 5000U;
-        char json[384];
+        char json[448];
         snprintf(json, sizeof(json),
                  "{\"stm32_online\":%s,\"app\":\"%s\",\"tmcu_deci\":%ld,\"text_deci\":%ld,"
+                 "\"game_hud\":%s,\"game_hud_persistent\":%s,"
                  "\"stm32_heap_kb\":%lu,\"stm32_min_heap_kb\":%lu,\"theme\":%u,"
                  "\"wifi_ssid\":\"%s\",\"wifi_ip\":\"%s\",\"wifi_rssi\":%d,"
                  "\"esp_heap_kb\":%lu,\"tx_cnt\":%lu,\"rx_cnt\":%lu,"
@@ -1458,6 +1474,8 @@ static void web_setup_routes(void)
                  s_stm32_online ? "true" : "false",
                  s_stm32_app,
                  (long)s_stm32_tmcu, (long)s_stm32_text,
+                 s_game_hud_mode ? "true" : "false",
+                 s_game_hud_persistent ? "true" : "false",
                  (unsigned long)s_stm32_heap, (unsigned long)s_stm32_min_heap,
                  (unsigned int)s_theme_idx,
                  s_wifi_ssid.c_str(),
@@ -1944,7 +1962,8 @@ void loop()
             }
             else if (s_game_hud_mode)
             {
-                s_game_hud_mode = false;
+                s_game_hud_mode       = false;
+                s_game_hud_persistent = false;
             }
             else
             {
