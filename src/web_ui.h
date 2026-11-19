@@ -46,8 +46,18 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
 .f-meta{color:var(--muted);font-size:0.74rem;min-width:52px;text-align:right}
 .f-acts{display:flex;gap:4px}
 .f-acts button{padding:3px 6px;font-size:0.74rem}
-.editor-wrap{flex:1;display:flex;flex-direction:column;min-height:420px}
+.editor-wrap{flex:1;display:flex;flex-direction:column;min-height:420px;position:relative}
 #codeArea{flex:1;width:100%;background:#090d14;color:#e8f0fe;border:none;padding:12px;font-family:'Cascadia Code',Consolas,'Courier New',monospace;font-size:0.9rem;line-height:1.45;resize:none;outline:none;tab-size:4}
+.ac-pop{position:absolute;z-index:50;min-width:280px;max-width:480px;background:#121a2a;border:1px solid var(--accent);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.6);font-family:Consolas,monospace;font-size:0.8rem;display:none;overflow:hidden}
+.ac-list{max-height:216px;overflow-y:auto}
+.ac-item{display:flex;align-items:center;gap:8px;padding:3px 8px;cursor:pointer;white-space:nowrap}
+.ac-item.sel{background:rgba(0,229,255,0.22)}
+.ac-ico{width:14px;text-align:center;font-weight:700}
+.ac-name b{color:var(--accent)}
+.ac-hint{margin-left:auto;color:var(--muted);overflow:hidden;text-overflow:ellipsis;padding-left:14px}
+.ac-doc{border-top:1px solid var(--border);padding:5px 8px;color:#b8c7dc;white-space:normal;background:#0e1522}
+.sig-tip{position:absolute;z-index:49;background:#0e1522;border:1px solid var(--amber);border-radius:5px;padding:3px 8px;font-family:Consolas,monospace;font-size:0.78rem;color:#e8f0fe;display:none;white-space:nowrap;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,0.5)}
+.sig-tip b{color:var(--amber)}
 .img-viewer{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:18px;background:#090d14;min-height:420px;overflow:auto}
 .img-stage{padding:12px;border-radius:10px;border:1px dashed var(--border);background:repeating-conic-gradient(#121824 0% 25%, #0c111a 0% 50%) 50% / 20px 20px;display:flex;align-items:center;justify-content:center;max-width:100%}
 #previewImg{max-width:100%;max-height:58vh;image-rendering:pixelated;border:1px solid var(--border);box-shadow:0 6px 24px rgba(0,0,0,0.6)}
@@ -136,6 +146,8 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
     </div>
     <div class="editor-wrap" id="editorWrap">
       <textarea id="codeArea" spellcheck="false" placeholder="Select any .c, .h, .txt, .md, .ini, .cfg, .log file on the left to view/edit, or click an image (.bmp, .png, .jpg) to preview..."></textarea>
+      <div id="acPop" class="ac-pop"><div id="acList" class="ac-list"></div><div id="acDoc" class="ac-doc"></div></div>
+      <div id="sigTip" class="sig-tip"></div>
     </div>
     <div class="img-viewer" id="imgWrap">
       <div class="img-stage">
@@ -149,13 +161,7 @@ button:hover,select:hover,.btn-label:hover{border-color:var(--accent);background
         <button onclick="setImgZoom(0)">Fit Window</button>
       </div>
     </div>
-    <div id="helpBox" class="help-box">
-      <b style="color:var(--accent)">C-Script Built-in Functions:</b><br>
-      • <b>Graphics:</b> clear_screen(rgb565); fill_rect(x,y,w,h,col); draw_pixel(x,y,col); draw_text(x,y,"str",fg,bg,scale); draw_num(x,y,val,fg,bg,scale,digits); RGB565(r,g,b);<br>
-      • <b>Input:</b> k = input_poll(); input_pressed(KEY_A | KEY_B | KEY_X | KEY_START | KEY_EXIT | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN); pad_lx(); pad_ly(); pad_rx(); pad_ry();<br>
-      • <b>Dual-Screen ESP32 HUD & Sensors:</b> esp_online(); esp_hud_clear(); esp_hud_text(line0_5, "str"); esp_hud_num(line0_5, "SCORE: ", val); esp_led(r,g,b); esp_hud_restore(); temp_mcu(); temp_ext(); weather_temp();<br>
-      • <b>System & Storage:</b> frame_sync(16); sleep_ms(ms); get_tick(); beep(ms); play_tone(freq_hz, ms); rand_range(min, max); clamp(val, lo, hi); save_int("best.dat", val); load_int("best.dat", def); exit();
-    </div>
+    <div id="helpBox" class="help-box"></div>
     <div id="padBox" class="pad-box">
       <div class="dpad">
         <div></div>
@@ -913,6 +919,7 @@ ta.addEventListener('input', () => {
 ta.addEventListener('click', updateCursorInfo);
 ta.addEventListener('keyup', updateCursorInfo);
 ta.addEventListener('keydown', (e) => {
+  if(acHandleKey(e)) return;
   if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's'){
     e.preventDefault();
     saveCurrentFile(false);
@@ -923,6 +930,414 @@ ta.addEventListener('keydown', (e) => {
     ta.selectionStart = ta.selectionEnd = s + 4;
   }
 });
+
+/* ==========================================================================
+ * C-Script autocomplete & signature help.
+ * CS_FUNCS / CS_ALIASES / CS_CONSTS mirror the built-ins of Core/Src/script_engine.c:
+ * keep them in sync when the interpreter gains new functions or constants.
+ * ========================================================================== */
+const CS_FUNCS = [
+  ['clear_screen','color','Graphics','Fill the whole 320x240 screen'],
+  ['fill_rect','x, y, w, h, color','Graphics','Fill a rectangle'],
+  ['draw_pixel','x, y, color','Graphics','Plot one pixel'],
+  ['draw_text','x, y, "text", fg, bg, scale','Graphics','Draw text; bg and scale are optional'],
+  ['draw_num','x, y, value, fg, bg, scale, digits','Graphics','Draw an integer; bg, scale and min digits are optional'],
+  ['RGB565','r, g, b','Graphics','Pack 8-bit R, G, B into an RGB565 color'],
+  ['input_poll','','Input','Refresh input once per frame; returns the held KEY_* mask'],
+  ['input_pressed','mask','Input','Keys newly pressed since the last input_poll()'],
+  ['input_held','mask','Input','Keys currently held down'],
+  ['input_repeat','mask','Input','Pressed with auto-repeat (menus, grid movement)'],
+  ['get_keys','','Input','Raw KEY_* mask without edge detection'],
+  ['pad_lx','','Input','Gamepad left stick X (-127..127)'],
+  ['pad_ly','','Input','Gamepad left stick Y (-127..127)'],
+  ['pad_rx','','Input','Gamepad right stick X (-127..127)'],
+  ['pad_ry','','Input','Gamepad right stick Y (-127..127)'],
+  ['pad_buttons','','Input','Raw gamepad SDK_PAD_* button mask'],
+  ['mouse_x','','Input','Mouse / touch X (0..319)'],
+  ['mouse_y','','Input','Mouse / touch Y (0..239)'],
+  ['mouse_buttons','','Input','Mouse buttons (bit 0 = left)'],
+  ['frame_sync','period_ms','Timing','Wait for the next frame (16 = ~60 FPS)'],
+  ['sleep_ms','ms','Timing','Sleep and yield the CPU to the OS'],
+  ['get_tick','','Timing','Milliseconds since boot'],
+  ['beep','ms','Sound','Buzzer beep (default 40 ms)'],
+  ['play_tone','freq_hz, ms','Sound','Tone (the current active buzzer ignores the frequency)'],
+  ['rand','n','Math','Random 0..n-1 (no argument: 0..2^31-1)'],
+  ['rand_range','min, max','Math','Random min..max-1'],
+  ['abs','x','Math','Absolute value'],
+  ['min','a, b','Math','Smaller of two values'],
+  ['max','a, b','Math','Larger of two values'],
+  ['clamp','value, lo, hi','Math','Limit value to lo..hi'],
+  ['save_int','"file", value','Storage','Save an int to SD:/appdata/<app>/file; returns 1 on success'],
+  ['load_int','"file", default','Storage','Load an int saved by save_int(), or default'],
+  ['file_open','"path", flags','Storage','Open a file with SDK_FILE_* flags; returns a handle or an error < 0'],
+  ['file_read','fd, buf, len','Storage','Read bytes into an array; returns the byte count'],
+  ['file_write','fd, buf, len','Storage','Write bytes from an array; returns the byte count'],
+  ['file_seek','fd, offset','Storage','Move to an absolute offset'],
+  ['file_size','fd','Storage','File size in bytes'],
+  ['file_close','fd','Storage','Close a file handle'],
+  ['file_remove','"path"','Storage','Delete a file or an empty folder'],
+  ['eeprom_read_u8','offset','Storage','Read an EEPROM byte (offset 0..127)'],
+  ['eeprom_write_u8','offset, value','Storage','Write an EEPROM byte (offset 0..127)'],
+  ['esp_online','','ESP32 & Sensors','1 if the ESP32-C6 companion is connected'],
+  ['esp_hud_clear','','ESP32 & Sensors','Switch the companion screen to Game HUD and clear it'],
+  ['esp_hud_text','line, "text"','ESP32 & Sensors','Set HUD line 0..5'],
+  ['esp_hud_num','line, "label", value','ESP32 & Sensors','Set HUD line 0..5 to label + number'],
+  ['esp_hud_restore','','ESP32 & Sensors','Return the companion to its normal pages'],
+  ['esp_led','r, g, b','ESP32 & Sensors','Set the companion RGB LED (0..255)'],
+  ['temp_mcu','','ESP32 & Sensors','MCU temperature in 0.1 \u00B0C'],
+  ['temp_ext','','ESP32 & Sensors','DS18B20 temperature in 0.1 \u00B0C, or SDK_TEMP_INVALID'],
+  ['weather_temp','','ESP32 & Sensors','Outdoor Open-Meteo temperature in 0.1 \u00B0C, or SDK_TEMP_INVALID'],
+  ['led_toggle','id','System','Toggle a board LED (default 1)'],
+  ['exit','','System','Quit the script and return to the OS']
+];
+const CS_ALIASES = {
+  sys_clear_screen:'clear_screen', sys_lcd_fill_rect:'fill_rect', sys_draw_pixel:'draw_pixel',
+  sys_draw_text:'draw_text', sys_draw_num:'draw_num', sdk_input_poll:'input_poll', sys_get_keys:'get_keys',
+  sdk_frame_sync:'frame_sync', sys_sleep_ms:'sleep_ms', delay_ms:'sleep_ms', sys_delay_ms:'sleep_ms',
+  sys_get_tick:'get_tick', sys_beep:'beep', sys_play_tone:'play_tone', random:'rand', sys_random:'rand',
+  sys_random_range:'rand_range', sys_file_open:'file_open', sys_file_read:'file_read', sys_file_write:'file_write',
+  sys_file_seek:'file_seek', sys_file_size:'file_size', sys_file_close:'file_close', sys_file_remove:'file_remove',
+  sys_esp_is_online:'esp_online', sys_esp_hud_clear:'esp_hud_clear', sys_esp_hud_text:'esp_hud_text',
+  sys_esp_hud_restore:'esp_hud_restore', sys_esp_set_led:'esp_led', sys_get_mcu_temp_deci:'temp_mcu',
+  sys_get_ext_temp_deci:'temp_ext', sys_get_weather_temp_deci:'weather_temp', sys_led_toggle:'led_toggle',
+  sys_exit:'exit', exit_app:'exit'
+};
+const CS_CONSTS = ('TRUE FALSE true false NULL SCREEN_W SCREEN_H SDK_SCREEN_W SDK_SCREEN_H ' +
+  'KEY_LEFT KEY_RIGHT KEY_UP KEY_DOWN KEY_A KEY_B KEY_X KEY_EXIT KEY_START ' +
+  'SDK_PAD_UP SDK_PAD_DOWN SDK_PAD_LEFT SDK_PAD_RIGHT SDK_PAD_A SDK_PAD_B SDK_PAD_X SDK_PAD_Y SDK_PAD_L1 SDK_PAD_R1 ' +
+  'SDK_PAD_L2 SDK_PAD_R2 SDK_PAD_START SDK_PAD_SELECT SDK_PAD_L3 SDK_PAD_R3 ' +
+  'COLOR_BLACK COLOR_WHITE COLOR_CYAN COLOR_NEON_GREEN COLOR_GREEN COLOR_AMBER COLOR_ORANGE COLOR_RED COLOR_BLUE ' +
+  'COLOR_MAGENTA COLOR_YELLOW COLOR_DARK_BG COLOR_PANEL_BG COLOR_GRID_LINE ' +
+  'SDK_FILE_READ SDK_FILE_WRITE SDK_FILE_CREATE SDK_FILE_TRUNC SDK_FILE_APPEND SDK_TEMP_INVALID').split(' ');
+const CS_KEYWORDS = ('if else for while do break continue return int char void bool const static unsigned ' +
+  'int8_t int16_t int32_t uint8_t uint16_t uint32_t define').split(' ');
+const CS_SNIPPETS = [
+  ['main', 'void main() {\n    clear_screen(COLOR_DARK_BG);\n    while (1) {\n        input_poll();\n        if (input_pressed(KEY_EXIT)) break;\n        $0\n        frame_sync(16);\n    }\n}', 'Game loop template'],
+  ['for', 'for (int i = 0; i < $0; i++) {\n}', 'for loop'],
+  ['while', 'while ($0) {\n}', 'while loop'],
+  ['if', 'if ($0) {\n}', 'if block']
+];
+
+function constDoc(n){
+  if(n.startsWith('KEY_')) return 'Key bit for input_pressed() / input_held() / get_keys()';
+  if(n.startsWith('SDK_PAD_')) return 'Gamepad button bit for pad_buttons()';
+  if(n.startsWith('COLOR_')) return 'RGB565 color';
+  if(n.startsWith('SDK_FILE_')) return 'file_open() flag';
+  if(n.indexOf('SCREEN_') >= 0) return 'Screen size in pixels (320 x 240)';
+  if(n === 'SDK_TEMP_INVALID') return 'Returned when a temperature source is absent';
+  return 'Built-in constant';
+}
+
+const CS_FN_MAP = {};
+const CS_ITEMS = [];
+CS_FUNCS.forEach(f => {
+  CS_FN_MAP[f[0]] = { name:f[0], params:f[1], group:f[2], doc:f[3] };
+  CS_ITEMS.push({ kind:'fn', name:f[0], params:f[1], hint:'(' + f[1] + ')', doc:f[3], rank:0 });
+});
+Object.keys(CS_ALIASES).forEach(a => {
+  const t = CS_FN_MAP[CS_ALIASES[a]];
+  CS_FN_MAP[a] = t;
+  CS_ITEMS.push({ kind:'fn', name:a, params:t.params, hint:'(' + t.params + ')', doc:'SDK alias of ' + t.name + '(): ' + t.doc, rank:5, alias:true });
+});
+CS_CONSTS.forEach(c => CS_ITEMS.push({ kind:'const', name:c, hint:'const', doc:constDoc(c), rank:2 }));
+CS_KEYWORDS.forEach(k => CS_ITEMS.push({ kind:'kw', name:k, hint:'keyword', doc:'C keyword', rank:3 }));
+CS_SNIPPETS.forEach(s => CS_ITEMS.push({ kind:'snip', name:s[0], body:s[1], hint:'snippet', doc:s[2], rank:4 }));
+const CS_BUILTIN_NAMES = new Set(CS_ITEMS.map(i => i.name));
+const AC_ICONS = { fn:['\u0192','#00e5ff'], var:['v','#c792ea'], const:['#','#ffae00'], kw:['k','#ff7b72'], snip:['\u29C9','#00ff66'] };
+
+const acPop = document.getElementById('acPop');
+const acListEl = document.getElementById('acList');
+const acDocEl = document.getElementById('acDoc');
+const sigTip = document.getElementById('sigTip');
+const acMirror = document.createElement('div');
+document.body.appendChild(acMirror);
+let acItems = [], acSel = 0, acOpen = false, acRange = null, acSuppress = false;
+
+function escHtml(s){
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function acEnabled(){
+  const f = (curFile || '').toLowerCase();
+  return f === '' || f.endsWith('.c') || f.endsWith('.h');
+}
+
+/* True when pos is inside a string literal or comment (simple single-line + block comment check) */
+function acInStringOrComment(text, pos){
+  const lastOpen = text.lastIndexOf('/*', pos - 1);
+  if(lastOpen >= 0 && text.lastIndexOf('*/', pos - 1) < lastOpen) return true;
+  const ls = text.lastIndexOf('\n', pos - 1) + 1;
+  const line = text.substring(ls, pos);
+  let inStr = false;
+  for(let i = 0; i < line.length; i++){
+    const c = line[i];
+    if(inStr){
+      if(c === '\\'){ i++; continue; }
+      if(c === '"') inStr = false;
+    } else if(c === '"' || c === "'"){
+      inStr = (c === '"');
+      if(c === "'"){ const e = line.indexOf("'", i + 1); if(e < 0) return true; i = e; }
+    } else if(c === '/' && line[i + 1] === '/'){
+      return true;
+    }
+  }
+  return inStr;
+}
+
+function caretXY(pos){
+  const cs = getComputedStyle(ta);
+  ['boxSizing','width','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth',
+   'paddingTop','paddingRight','paddingBottom','paddingLeft','fontStyle','fontVariant','fontWeight',
+   'fontSize','lineHeight','fontFamily','letterSpacing','wordSpacing','tabSize','textIndent'].forEach(p => acMirror.style[p] = cs[p]);
+  const s = acMirror.style;
+  s.position = 'absolute'; s.visibility = 'hidden'; s.whiteSpace = 'pre-wrap'; s.wordWrap = 'break-word';
+  s.top = '0'; s.left = '-9999px'; s.overflow = 'hidden'; s.height = 'auto';
+  s.boxSizing = 'border-box'; s.width = ta.clientWidth + 'px'; s.borderWidth = '0';
+  acMirror.textContent = ta.value.substring(0, pos);
+  const sp = document.createElement('span');
+  sp.textContent = ta.value.substring(pos, pos + 1) || '.';
+  acMirror.appendChild(sp);
+  const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.45) || 18;
+  return { x: ta.offsetLeft + sp.offsetLeft - ta.scrollLeft, y: ta.offsetTop + sp.offsetTop - ta.scrollTop, h: lh };
+}
+
+function acCurrentWord(){
+  const v = ta.value, pos = ta.selectionStart;
+  let s = pos, e = pos;
+  while(s > 0 && /\w/.test(v[s - 1])) s--;
+  while(e < v.length && /\w/.test(v[e])) e++;
+  return { start:s, end:e, prefix:v.substring(s, pos) };
+}
+
+function acMatchScore(name, prefix){
+  if(name.startsWith(prefix)) return 0;
+  const ln = name.toLowerCase(), lp = prefix.toLowerCase();
+  if(ln.startsWith(lp)) return 1;
+  if(ln.indexOf('_' + lp) > 0) return 2;
+  return -1;
+}
+
+function acUpdate(force){
+  if(!acEnabled() || ta.selectionStart !== ta.selectionEnd){ acHide(); return; }
+  const w = acCurrentWord();
+  const v = ta.value;
+  if(acInStringOrComment(v, w.start)){ acHide(); return; }
+  if(!force && w.prefix.length < 2){ acHide(); return; }
+  if(w.prefix && /^\d/.test(w.prefix)){ acHide(); return; }
+
+  const locals = new Set();
+  const other = (v.substring(0, w.start) + ' ' + v.substring(w.end))
+    .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?/g, ' ');
+  const re = /\b[A-Za-z_]\w{2,}\b/g;
+  let m;
+  while((m = re.exec(other)) !== null){
+    if(!CS_BUILTIN_NAMES.has(m[0]) && m[0] !== w.prefix) locals.add(m[0]);
+  }
+  const pool = CS_ITEMS.concat(Array.from(locals).map(n => ({ kind:'var', name:n, hint:'in file', doc:'Identifier used in this file', rank:1 })));
+
+  const found = [];
+  pool.forEach(it => {
+    if(!w.prefix){ if(!it.alias) found.push({ it, sc:0 }); return; }
+    const sc = acMatchScore(it.name, w.prefix);
+    if(sc < 0 || (sc === 2 && it.alias)) return;
+    found.push({ it, sc });
+  });
+  found.sort((a, b) => (a.sc - b.sc) || (a.it.rank - b.it.rank) || (a.it.name.length - b.it.name.length) || a.it.name.localeCompare(b.it.name));
+  acItems = found.slice(0, 40).map(f => f.it);
+
+  if(acItems.length === 0 || (!force && acItems.every(i => i.name === w.prefix))){ acHide(); return; }
+  acRange = { start:w.start, end:w.end, prefix:w.prefix };
+  acSel = 0;
+  acOpen = true;
+  acRender();
+  acPosition();
+}
+
+function acRender(){
+  const p = acRange ? acRange.prefix.length : 0;
+  acListEl.innerHTML = acItems.map((it, i) => {
+    const ic = AC_ICONS[it.kind];
+    const nm = it.name.toLowerCase().startsWith(acRange.prefix.toLowerCase())
+      ? '<b>' + escHtml(it.name.substring(0, p)) + '</b>' + escHtml(it.name.substring(p))
+      : escHtml(it.name);
+    return '<div class="ac-item' + (i === acSel ? ' sel' : '') + '" data-i="' + i + '">' +
+      '<span class="ac-ico" style="color:' + ic[1] + (it.alias ? ';opacity:0.55' : '') + '">' + ic[0] + '</span>' +
+      '<span class="ac-name">' + nm + '</span><span class="ac-hint">' + escHtml(it.hint) + '</span></div>';
+  }).join('');
+  const cur = acItems[acSel];
+  acDocEl.innerHTML = cur
+    ? (cur.kind === 'fn' ? '<b style="color:var(--accent)">' + escHtml(cur.name + '(' + cur.params + ')') + '</b><br>' : '') + escHtml(cur.doc) +
+      '<div style="color:var(--muted);margin-top:2px">\u2191\u2193 select \u00B7 Tab/Enter insert \u00B7 Esc close</div>'
+    : '';
+  const selEl = acListEl.querySelector('.ac-item.sel');
+  if(selEl) selEl.scrollIntoView({ block:'nearest' });
+}
+
+function acPosition(){
+  if(!acOpen || !acRange) return;
+  const c = caretXY(acRange.start);
+  const wrap = document.getElementById('editorWrap');
+  acPop.style.display = 'block';
+  const pw = acPop.offsetWidth, ph = acPop.offsetHeight;
+  let left = Math.max(4, Math.min(c.x, wrap.clientWidth - pw - 4));
+  let top = c.y + c.h + 2;
+  if(top + ph > wrap.clientHeight - 4 && c.y - ph - 2 > 0) top = c.y - ph - 2;
+  acPop.style.left = left + 'px';
+  acPop.style.top = top + 'px';
+}
+
+function acHide(){
+  acOpen = false;
+  acItems = [];
+  acPop.style.display = 'none';
+}
+
+function acInsert(text, start, end){
+  ta.focus();
+  ta.setSelectionRange(start, end);
+  acSuppress = true;
+  const ok = document.queryCommandSupported && document.queryCommandSupported('insertText') &&
+             document.execCommand('insertText', false, text);
+  if(!ok){
+    ta.setRangeText(text, start, end, 'end');
+    ta.dispatchEvent(new Event('input'));
+  }
+  acSuppress = false;
+}
+
+function acAccept(idx){
+  const it = acItems[idx];
+  if(!it || !acRange) return;
+  const { start, end } = acRange;
+  const v = ta.value;
+  let text = it.name, caret = null;
+  if(it.kind === 'fn'){
+    if(!/^\s*\(/.test(v.substring(end))){
+      text = it.name + '()';
+      caret = it.params ? it.name.length + 1 : text.length;
+    }
+  } else if(it.kind === 'snip'){
+    const ls = v.lastIndexOf('\n', start - 1) + 1;
+    const indent = v.substring(ls, start).match(/^\s*/)[0];
+    text = it.body.replace(/\n/g, '\n' + indent);
+    caret = text.indexOf('$0');
+    text = text.replace('$0', '');
+    if(caret < 0) caret = text.length;
+  }
+  acInsert(text, start, end);
+  if(caret !== null) ta.setSelectionRange(start + caret, start + caret);
+  acHide();
+  sigUpdate();
+  updateCursorInfo();
+}
+
+function acHandleKey(e){
+  if((e.ctrlKey || e.metaKey) && (e.code === 'Space' || e.key === ' ')){
+    e.preventDefault();
+    acUpdate(true);
+    return true;
+  }
+  if(!acOpen){
+    if(e.key === 'Escape' && sigTip.style.display === 'block'){ e.preventDefault(); sigHide(); return true; }
+    return false;
+  }
+  const n = acItems.length;
+  switch(e.key){
+    case 'ArrowDown': acSel = (acSel + 1) % n; break;
+    case 'ArrowUp':   acSel = (acSel - 1 + n) % n; break;
+    case 'PageDown':  acSel = Math.min(n - 1, acSel + 8); break;
+    case 'PageUp':    acSel = Math.max(0, acSel - 8); break;
+    case 'Enter':
+    case 'Tab':       e.preventDefault(); acAccept(acSel); return true;
+    case 'Escape':    e.preventDefault(); acHide(); return true;
+    default:          return false;
+  }
+  e.preventDefault();
+  acRender();
+  return true;
+}
+
+/* Finds the innermost unclosed call before pos: returns { name, arg } or null */
+function sigFindCall(text, pos){
+  let depth = 0, commas = 0, inStr = false;
+  const lim = Math.max(0, pos - 600);
+  for(let i = pos - 1; i >= lim; i--){
+    const c = text[i];
+    if(c === '"' && text[i - 1] !== '\\'){ inStr = !inStr; continue; }
+    if(inStr) continue;
+    if(c === ')'){ depth++; }
+    else if(c === '('){
+      if(depth === 0){
+        let j = i - 1;
+        while(j >= 0 && text[j] === ' ') j--;
+        const e = j + 1;
+        while(j >= 0 && /\w/.test(text[j])) j--;
+        const name = text.substring(j + 1, e);
+        return name ? { name, arg:commas } : null;
+      }
+      depth--;
+    }
+    else if(c === ',' && depth === 0){ commas++; }
+    else if(c === ';' || c === '{' || c === '}'){ return null; }
+  }
+  return null;
+}
+
+function sigHide(){ sigTip.style.display = 'none'; }
+
+function sigUpdate(){
+  if(!acEnabled() || ta.selectionStart !== ta.selectionEnd){
+    sigHide();
+    return;
+  }
+  const call = sigFindCall(ta.value, ta.selectionStart);
+  const fn = call ? CS_FN_MAP[call.name] : null;
+  if(!fn){ sigHide(); return; }
+  const params = fn.params ? fn.params.split(', ') : [];
+  const shown = params.map((p, i) => i === call.arg ? '<b>' + escHtml(p) + '</b>' : escHtml(p)).join(', ');
+  sigTip.innerHTML = escHtml(call.name) + '(' + shown + ')' + ' <span style="color:var(--muted)">\u2014 ' + escHtml(fn.doc) + '</span>';
+  const c = caretXY(ta.selectionStart);
+  const wrap = document.getElementById('editorWrap');
+  sigTip.style.display = 'block';
+  const tw = sigTip.offsetWidth;
+  sigTip.style.left = Math.min(Math.max(4, c.x - 8), Math.max(4, wrap.clientWidth - tw - 4)) + 'px';
+  sigTip.style.top = Math.max(2, c.y - sigTip.offsetHeight - 3) + 'px';
+}
+
+ta.addEventListener('input', (e) => {
+  if(acSuppress) return;
+  const t = e.inputType || '';
+  if(t.startsWith('insert') && e.data && /^\w$/.test(e.data)) acUpdate(false);
+  else if(t.startsWith('delete') && acOpen) acUpdate(false);
+  else acHide();
+  sigUpdate();
+});
+ta.addEventListener('keyup', (e) => {
+  if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key) || (!acOpen && ['ArrowUp','ArrowDown','PageUp','PageDown'].includes(e.key))){
+    acHide();
+    sigUpdate();
+  }
+});
+ta.addEventListener('click', () => { acHide(); sigUpdate(); });
+ta.addEventListener('scroll', () => { acPosition(); if(sigTip.style.display === 'block') sigUpdate(); });
+ta.addEventListener('blur', () => { acHide(); sigHide(); });
+acPop.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  const row = e.target.closest('.ac-item');
+  if(row) acAccept(parseInt(row.dataset.i, 10));
+});
+
+function renderApiHelp(){
+  const groups = {};
+  CS_FUNCS.forEach(f => { (groups[f[2]] = groups[f[2]] || []).push(f[0] + '(' + f[1] + ')'); });
+  let h = '<b style="color:var(--accent)">C-Script Built-in Functions</b> ' +
+          '<span style="color:var(--muted)">(type 2+ letters or Ctrl+Space for autocomplete; Tab/Enter inserts)</span><br>';
+  Object.keys(groups).forEach(g => { h += '\u2022 <b>' + escHtml(g) + ':</b> ' + groups[g].map(escHtml).join('; ') + '<br>'; });
+  h += '\u2022 <b>Constants:</b> KEY_*, SDK_PAD_*, COLOR_*, SDK_FILE_*, SCREEN_W / SCREEN_H, SDK_TEMP_INVALID, TRUE / FALSE / NULL<br>';
+  h += '\u2022 <b>SDK aliases:</b> sys_* / sdk_* names (e.g. sys_draw_text, sdk_frame_sync) are accepted too.';
+  document.getElementById('helpBox').innerHTML = h;
+}
+renderApiHelp();
 
 loadDir('/');
 pollStatus();
